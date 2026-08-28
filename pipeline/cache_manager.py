@@ -16,12 +16,9 @@ CACHE_FILE = config.processing_dir.parent / "processed_history.json"
 _LOCK = threading.Lock()
 
 def get_file_md5_quick(file_path: Path) -> str:
-    """Compute MD5 checksum of a file efficiently."""
-    hasher = hashlib.md5()
+    """Compute MD5 checksum using Python 3.11+ stdlib file_digest."""
     with open(file_path, "rb") as f:
-        for chunk in iter(lambda: f.read(65536), b""):
-            hasher.update(chunk)
-    return hasher.hexdigest()
+        return hashlib.file_digest(f, "md5").hexdigest()
 
 def load_cache() -> Dict[str, Any]:
     """Load the processed history JSON cache."""
@@ -49,16 +46,10 @@ def save_cache(cache_data: Dict[str, Any]) -> None:
                 temp_cache.unlink(missing_ok=True)
 
 def is_already_processed(file_path: Path) -> Optional[Dict[str, Any]]:
-    """
-    Check if a file has already been successfully processed.
-    Matches by original MD5 hash to prevent duplicate rendering.
-    """
+    """Check if a file has already been successfully processed by MD5."""
     if not file_path.exists():
         return None
-    
-    file_md5 = get_file_md5_quick(file_path)
-    cache = load_cache()
-    return cache.get(file_md5)
+    return load_cache().get(get_file_md5_quick(file_path))
 
 def record_processed_video(
     original_md5: str,
@@ -90,26 +81,18 @@ def record_processed_video(
     logger.info(f"[Cache Recorded] '{original_name}' (MD5: {original_md5[:8]}) saved to history ledger.")
 
 def cleanup_stale_processing() -> int:
-    """
-    Scans the processing/ directory on startup to clean up leftover tmp_ files
-    from interrupted or crashed runs, preventing stuck locks or stalled queues.
-    Returns the number of files recovered or cleaned.
-    """
+    """Clean up leftover tmp_ files and recover interrupted files on startup."""
     if not config.processing_dir.exists():
         return 0
-    
     cleaned_count = 0
     for item in config.processing_dir.iterdir():
         if item.is_file():
             if item.name.startswith("tmp_"):
                 item.unlink(missing_ok=True)
-                cleaned_count += 1
             else:
-                target_input = config.input_dir / item.name
-                shutil.move(str(item), str(target_input))
+                shutil.move(str(item), str(config.input_dir / item.name))
                 logger.info(f"[Auto-Recovery] Recovered interrupted file back to input/: '{item.name}'")
-                cleaned_count += 1
-                
+            cleaned_count += 1
     if cleaned_count > 0:
         logger.info(f"[Startup Stale Cleanup] Cleaned / recovered {cleaned_count} leftover file(s).")
     return cleaned_count

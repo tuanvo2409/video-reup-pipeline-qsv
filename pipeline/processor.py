@@ -1,4 +1,3 @@
-import hashlib
 import json
 import logging
 import random
@@ -94,13 +93,13 @@ def process_single_video(
     force_reprocess: bool = False,
 ) -> ProcessResult:
     """
-    Process a single video through the complete pipeline with Smart Cache Check,
+    Process a single video through the complete pipeline with Smart Cache,
     PySceneDetect nonlinear speedup, vPDQ score assessment, Intel QSV acceleration, and DUBVI Bridge.
     """
     start_time = time.time()
     config.ensure_dirs()
 
-    # 1. Smart Cache Lookup (Tránh render lại video cũ nếu không có cờ --force)
+    # 1. Smart Cache Lookup
     if not force_reprocess and source_path.exists():
         cached_info = is_already_processed(source_path)
         if cached_info:
@@ -133,7 +132,6 @@ def process_single_video(
             error_message=f"I/O move error: {e}"
         )
 
-    # Compute original MD5 hash & video duration
     original_md5 = get_file_md5_quick(temp_processing_path)
     total_duration = get_video_duration(temp_processing_path)
 
@@ -144,16 +142,8 @@ def process_single_video(
     trimmed_str = "None"
 
     if do_trim and total_duration > 3.0:
-        if custom_trim_start is not None:
-            trim_start = custom_trim_start
-        else:
-            trim_start = round(random.uniform(*config.trim_start_range), 3)
-
-        if custom_trim_end is not None:
-            trim_end_offset = custom_trim_end
-        else:
-            trim_end_offset = round(random.uniform(*config.trim_end_range), 3)
-
+        trim_start = custom_trim_start if custom_trim_start is not None else round(random.uniform(*config.trim_start_range), 3)
+        trim_end_offset = custom_trim_end if custom_trim_end is not None else round(random.uniform(*config.trim_end_range), 3)
         trim_end = max(1.0, round(total_duration - trim_end_offset, 3))
         trimmed_str = f"Head: {trim_start}s | Tail: {trim_end_offset}s"
 
@@ -165,13 +155,11 @@ def process_single_video(
     if use_smart_scenes and total_duration > 5.0:
         raw_scenes = detect_scenes(temp_processing_path, threshold=config.scene_threshold)
         if len(raw_scenes) > 1:
-            adjusted_scenes = []
-            for s_start, s_end in raw_scenes:
-                cl_start = max(trim_start, s_start)
-                cl_end = min(trim_end if trim_end is not None else total_duration, s_end)
-                if cl_end - cl_start >= 0.4:
-                    adjusted_scenes.append((cl_start, cl_end))
-
+            adjusted_scenes = [
+                (max(trim_start, s_start), min(trim_end if trim_end is not None else total_duration, s_end))
+                for s_start, s_end in raw_scenes
+                if min(trim_end if trim_end is not None else total_duration, s_end) - max(trim_start, s_start) >= 0.4
+            ]
             if adjusted_scenes:
                 scene_schedule = assign_scene_speeds(
                     adjusted_scenes,
@@ -192,11 +180,9 @@ def process_single_video(
     outro_file = pick_random_asset(config.outros_dir, config.supported_extensions)
     bgm_file = pick_random_asset(config.bgm_dir, config.supported_audio_extensions)
     frame_file = pick_random_asset(config.frames_dir, config.supported_image_extensions)
-    
-    # Pick invisible watermark mask
-    watermark_file = pick_random_asset(config.watermarks_dir, config.supported_image_extensions)
-    if not watermark_file and config.default_watermark.exists():
-        watermark_file = config.default_watermark
+    watermark_file = pick_random_asset(config.watermarks_dir, config.supported_image_extensions) or (
+        config.default_watermark if config.default_watermark.exists() else None
+    )
 
     encoder = override_encoder or detect_best_encoder()
     layout = override_mode or config.layout_mode
@@ -229,47 +215,33 @@ def process_single_video(
         scene_schedule=scene_schedule,
     )
 
-    zoom_info_str = f"Zoom: {builder.zoom:.3f}x"
     logger.info(
         f"Processing '{temp_processing_path.name}' [Mode: {layout} | "
-        f"Encoder: {encoder} | {speed_info_str} | {zoom_info_str} | "
+        f"Encoder: {encoder} | {speed_info_str} | Zoom: {builder.zoom:.3f}x | "
         f"Trim: {trimmed_str} (~1s)]"
     )
 
-    # Try hardware encoder first, then fallback to CPU if needed
-    encoders_to_try = [encoder]
-    if encoder != "libx264":
-        encoders_to_try.append("libx264")
-
+    # Direct Hardware Execution
+    cmd = builder.build_command()
     success = False
     last_error = ""
-    used_encoder = encoder
 
-    for current_enc in encoders_to_try:
-        used_encoder = current_enc
-        builder.encoder = current_enc
-        cmd = builder.build_command()
-
-        try:
-            process = subprocess.run(
-                cmd,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
-            )
-
-            if process.returncode == 0 and temp_output_path.exists() and temp_output_path.stat().st_size > 0:
-                success = True
-                break
-            else:
-                last_error = process.stderr[-1000:] if process.stderr else "Unknown error"
-                logger.warning(f"Encoder '{current_enc}' failed on {temp_processing_path.name}: {last_error[:200]}")
-                if temp_output_path.exists():
-                    temp_output_path.unlink()
-        except Exception as e:
-            last_error = str(e)
-            logger.warning(f"Execution exception with '{current_enc}': {e}")
+    try:
+        process = subprocess.run(
+            cmd,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            creationflags=subprocess.CREATE_NO_WINDOW if hasattr(subprocess, "CREATE_NO_WINDOW") else 0
+        )
+        if process.returncode == 0 and temp_output_path.exists() and temp_output_path.stat().st_size > 0:
+            success = True
+        else:
+            last_error = process.stderr[-1000:] if process.stderr else "Unknown render error"
+            if temp_output_path.exists():
+                temp_output_path.unlink()
+    except Exception as e:
+        last_error = str(e)
 
     duration = time.time() - start_time
 
@@ -327,10 +299,10 @@ def process_single_video(
             duration_seconds=duration,
             original_md5=original_md5,
             output_md5=new_md5,
-            encoder_used=used_encoder,
+            encoder_used=encoder,
             layout_mode=layout,
             trimmed_info=trimmed_str,
-            zoom_info=zoom_info_str,
+            zoom_info=f"Zoom: {builder.zoom:.3f}x",
             speed_info=speed_info_str,
             vpdq_score_info=vpdq_info_str,
             dubvi_forwarded=dubvi_forwarded,
@@ -344,10 +316,10 @@ def process_single_video(
             input_file=source_path,
             duration_seconds=duration,
             original_md5=original_md5,
-            encoder_used=used_encoder,
+            encoder_used=encoder,
             layout_mode=layout,
             trimmed_info=trimmed_str,
-            zoom_info=zoom_info_str,
+            zoom_info=f"Zoom: {builder.zoom:.3f}x",
             speed_info=speed_info_str,
             error_message=last_error,
         )

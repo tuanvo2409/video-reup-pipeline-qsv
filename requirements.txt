@@ -1,0 +1,3 @@
+# Python Standard Library handles all core features (pathlib, subprocess, concurrent.futures, hashlib, logging)
+# Optional enhancements:
+tqdm>=4.66.0

@@ -1,0 +1,43 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Temporary and local processing directories
+input/*
+!input/.gitkeep
+processing/*
+!processing/.gitkeep
+output/*
+!output/.gitkeep
+failed/*
+!failed/.gitkeep
+
+# Ignore video and large media files in root/subfolders
+*.mp4
+*.mov
+*.mkv
+*.avi
+*.webm
+*.ts
+*.wav
+*.tmp
+
+# Logs and system caches
+*.log
+system.log
+processed_history.json
+processed_history.tmp
+
+# Environments
+.venv/
+env/
+venv/
+.env
+
+# OS / Editor files
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

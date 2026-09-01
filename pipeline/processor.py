@@ -13,6 +13,7 @@ from pipeline.hardware import detect_best_encoder
 from pipeline.ffmpeg_builder import FFmpegCommandBuilder
 from pipeline.scene_manager import detect_scenes, assign_scene_speeds
 from pipeline.vpdq_scorer import score_video_pair
+from pipeline.profile_manager import get_channel_profile, ChannelProfile
 from pipeline.cache_manager import (
     is_already_processed,
     record_processed_video,
@@ -36,6 +37,7 @@ class ProcessResult:
     zoom_info: Optional[str] = None
     speed_info: Optional[str] = None
     vpdq_score_info: Optional[str] = None
+    profile_name: str = "default"
     cache_hit: bool = False
     dubvi_forwarded: bool = False
     error_message: Optional[str] = None
@@ -63,15 +65,16 @@ def get_video_duration(file_path: Path) -> float:
         logger.warning(f"Failed to get duration for {file_path.name}: {e}")
     return 0.0
 
-def pick_random_asset(folder: Path, valid_extensions: tuple) -> Optional[Path]:
+def pick_random_asset(folder: Optional[Path], valid_extensions: tuple) -> Optional[Path]:
     """Select a random file from a folder matching the extensions."""
-    if not folder.exists():
+    if not folder or not folder.exists():
         return None
     files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in valid_extensions]
     return random.choice(files) if files else None
 
 def process_single_video(
     source_path: Path,
+    override_profile: Optional[str] = None,
     override_encoder: Optional[str] = None,
     override_mode: Optional[str] = None,
     enable_mask: Optional[bool] = None,
@@ -93,11 +96,25 @@ def process_single_video(
     force_reprocess: bool = False,
 ) -> ProcessResult:
     """
-    Process a single video through the complete pipeline with Smart Cache,
-    PySceneDetect nonlinear speedup, vPDQ score assessment, Intel QSV acceleration, and DUBVI Bridge.
+    Process a single video with Multi-Profile support, PySceneDetect nonlinear speedup,
+    vPDQ score assessment, Intel QSV acceleration, and DUBVI Bridge.
     """
     start_time = time.time()
     config.ensure_dirs()
+
+    # Determine channel profile from subfolder or override
+    profile_name = "default"
+    if override_profile:
+        profile_name = override_profile
+    else:
+        try:
+            rel = source_path.relative_to(config.input_dir)
+            if len(rel.parts) > 1:
+                profile_name = rel.parts[0]
+        except Exception:
+            profile_name = "default"
+
+    profile: ChannelProfile = get_channel_profile(profile_name)
 
     # 1. Smart Cache Lookup
     if not force_reprocess and source_path.exists():
@@ -105,7 +122,7 @@ def process_single_video(
         if cached_info:
             out_file_path = Path(cached_info["output_path"])
             logger.info(
-                f"[CACHE HIT] '{source_path.name}' was already processed on {cached_info['processed_at']}. "
+                f"[CACHE HIT] [{profile_name}] '{source_path.name}' was already processed on {cached_info['processed_at']}. "
                 f"Skipping render. (Use --force to re-render fresh variations)."
             )
             source_path.unlink(missing_ok=True)
@@ -116,12 +133,14 @@ def process_single_video(
                 duration_seconds=0.0,
                 original_md5=cached_info["original_md5"],
                 output_md5=cached_info["output_md5"],
+                profile_name=profile_name,
                 cache_hit=True,
                 vpdq_score_info=f"Cached vPDQ: {cached_info.get('vpdq_score')}% [{cached_info.get('vpdq_status')}]",
             )
 
     # 2. Move from input to processing
-    temp_processing_path = config.processing_dir / source_path.name
+    temp_filename = f"{profile_name}_{source_path.name}" if profile_name != "default" else source_path.name
+    temp_processing_path = config.processing_dir / temp_filename
     try:
         shutil.move(str(source_path), str(temp_processing_path))
     except Exception as e:
@@ -129,6 +148,7 @@ def process_single_video(
         return ProcessResult(
             success=False,
             input_file=source_path,
+            profile_name=profile_name,
             error_message=f"I/O move error: {e}"
         )
 
@@ -142,12 +162,12 @@ def process_single_video(
     trimmed_str = "None"
 
     if do_trim and total_duration > 3.0:
-        trim_start = custom_trim_start if custom_trim_start is not None else round(random.uniform(*config.trim_start_range), 3)
-        trim_end_offset = custom_trim_end if custom_trim_end is not None else round(random.uniform(*config.trim_end_range), 3)
+        trim_start = custom_trim_start if custom_trim_start is not None else round(random.uniform(*profile.trim_start_range), 3)
+        trim_end_offset = custom_trim_end if custom_trim_end is not None else round(random.uniform(*profile.trim_end_range), 3)
         trim_end = max(1.0, round(total_duration - trim_end_offset, 3))
         trimmed_str = f"Head: {trim_start}s | Tail: {trim_end_offset}s"
 
-    # PySceneDetect Nonlinear Scene Speed Scheduling
+    # PySceneDetect Nonlinear Scene Speed Scheduling (Using Profile Speed Range)
     use_smart_scenes = config.enable_smart_scenes if enable_smart_scenes is None else enable_smart_scenes
     scene_schedule = None
     speed_info_str = "Speed: 1.15x (Uniform)"
@@ -163,29 +183,35 @@ def process_single_video(
             if adjusted_scenes:
                 scene_schedule = assign_scene_speeds(
                     adjusted_scenes,
-                    speed_min=config.tempo_min,
-                    speed_max=config.tempo_max
+                    speed_min=profile.speed_range[0],
+                    speed_max=profile.speed_range[1]
                 )
                 speeds_sample = [f"{s[2]}x" for s in scene_schedule[:3]]
                 speed_info_str = f"Smart Scenes: {len(scene_schedule)} cuts ({', '.join(speeds_sample)}...)"
 
-    # Output file paths
-    output_filename = f"processed_{temp_processing_path.stem}.mp4"
-    final_output_path = config.output_dir / output_filename
-    temp_output_path = config.processing_dir / f"tmp_{output_filename}"
+    # Output paths (Categorized by Channel Profile folder)
+    target_out_dir = config.output_dir / profile_name if profile_name != "default" else config.output_dir
+    target_out_dir.mkdir(parents=True, exist_ok=True)
+    
+    output_filename = f"processed_{source_path.stem}.mp4"
+    final_output_path = target_out_dir / output_filename
+    meta_output_path = target_out_dir / f"processed_{source_path.stem}.meta.json"
+    temp_output_path = config.processing_dir / f"tmp_{temp_filename}"
 
-    # Pick optional assets
-    mascot_file = pick_random_asset(config.mascots_dir, (".webm", ".mov", ".png"))
-    hook_file = pick_random_asset(config.hooks_dir, config.supported_extensions)
-    outro_file = pick_random_asset(config.outros_dir, config.supported_extensions)
-    bgm_file = pick_random_asset(config.bgm_dir, config.supported_audio_extensions)
+    # Pick channel-specific or global assets
+    mascot_file = profile.mascot_path or pick_random_asset(config.mascots_dir, (".webm", ".mov", ".png"))
+    hook_file = pick_random_asset(profile.hooks_dir, config.supported_extensions) or pick_random_asset(config.hooks_dir, config.supported_extensions)
+    outro_file = pick_random_asset(profile.outros_dir, config.supported_extensions) or pick_random_asset(config.outros_dir, config.supported_extensions)
+    bgm_file = pick_random_asset(profile.bgm_dir, config.supported_audio_extensions) or pick_random_asset(config.bgm_dir, config.supported_audio_extensions)
     frame_file = pick_random_asset(config.frames_dir, config.supported_image_extensions)
-    watermark_file = pick_random_asset(config.watermarks_dir, config.supported_image_extensions) or (
+    watermark_file = profile.watermark_path or pick_random_asset(config.watermarks_dir, config.supported_image_extensions) or (
         config.default_watermark if config.default_watermark.exists() else None
     )
 
     encoder = override_encoder or detect_best_encoder()
     layout = override_mode or config.layout_mode
+    effective_hflip = enable_hflip if enable_hflip is not None else profile.enable_hflip
+    effective_inv_opacity = invisible_mask_opacity if invisible_mask_opacity is not None else profile.invisible_mask_opacity
 
     # Build command
     builder = FFmpegCommandBuilder(
@@ -203,8 +229,8 @@ def process_single_video(
         mask_ratio=mask_ratio,
         enable_frame=enable_frame,
         enable_invisible_mask=enable_invisible_mask,
-        invisible_mask_opacity=invisible_mask_opacity,
-        enable_hflip=enable_hflip,
+        invisible_mask_opacity=effective_inv_opacity,
+        enable_hflip=effective_hflip,
         enable_grain=enable_grain,
         enable_jitter=enable_jitter,
         enable_tempo=enable_tempo,
@@ -216,9 +242,9 @@ def process_single_video(
     )
 
     logger.info(
-        f"Processing '{temp_processing_path.name}' [Mode: {layout} | "
+        f"Processing [{profile_name}] '{source_path.name}' [Mode: {layout} | "
         f"Encoder: {encoder} | {speed_info_str} | Zoom: {builder.zoom:.3f}x | "
-        f"Trim: {trimmed_str} (~1s)]"
+        f"HFlip: {effective_hflip} | Trim: {trimmed_str}]"
     )
 
     # Direct Hardware Execution
@@ -264,6 +290,27 @@ def process_single_video(
 
         new_md5 = get_file_md5_quick(final_output_path)
 
+        # Write unique metadata receipt for this video
+        meta_data = {
+            "channel_profile": profile_name,
+            "original_filename": source_path.name,
+            "output_filename": final_output_path.name,
+            "original_md5": original_md5,
+            "output_md5": new_md5,
+            "duration_seconds": round(duration, 2),
+            "zoom_factor": round(builder.zoom, 4),
+            "horizontal_flip": effective_hflip,
+            "invisible_mask_opacity": effective_inv_opacity,
+            "vpdq_similarity_percent": vpdq_score_val,
+            "vpdq_status": vpdq_status_val,
+            "processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        try:
+            with open(meta_output_path, "w", encoding="utf-8") as mf:
+                json.dump(meta_data, mf, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logger.warning(f"Failed to write metadata json: {e}")
+
         # Record in Processed Cache History Ledger
         record_processed_video(
             original_md5=original_md5,
@@ -280,16 +327,17 @@ def process_single_video(
         dubvi_forwarded = False
         if do_send_dubvi:
             try:
-                config.dubvi_media_dir.mkdir(parents=True, exist_ok=True)
-                dest_dubvi_file = config.dubvi_media_dir / final_output_path.name
+                target_dubvi_dir = config.dubvi_media_dir / profile_name if profile_name != "default" else config.dubvi_media_dir
+                target_dubvi_dir.mkdir(parents=True, exist_ok=True)
+                dest_dubvi_file = target_dubvi_dir / final_output_path.name
                 shutil.copy2(str(final_output_path), str(dest_dubvi_file))
                 dubvi_forwarded = True
-                logger.info(f"-> [DUBVI Bridge] Auto-copied to DUBVI media folder: '{dest_dubvi_file.name}'")
+                logger.info(f"-> [DUBVI Bridge] Auto-copied to DUBVI folder: '{profile_name}/{dest_dubvi_file.name}'")
             except Exception as e:
                 logger.warning(f"Failed to copy to DUBVI media dir: {e}")
 
         logger.info(
-            f"Successfully processed: '{final_output_path.name}' in {duration:.2f}s "
+            f"Successfully processed: [{profile_name}] '{final_output_path.name}' in {duration:.2f}s "
             f"[{vpdq_info_str} | Orig MD5: {original_md5[:8]} -> New MD5: {new_md5[:8]}]"
         )
         return ProcessResult(
@@ -305,10 +353,13 @@ def process_single_video(
             zoom_info=f"Zoom: {builder.zoom:.3f}x",
             speed_info=speed_info_str,
             vpdq_score_info=vpdq_info_str,
+            profile_name=profile_name,
             dubvi_forwarded=dubvi_forwarded,
         )
     else:
-        failed_path = config.failed_dir / temp_processing_path.name
+        failed_dir = config.failed_dir / profile_name if profile_name != "default" else config.failed_dir
+        failed_dir.mkdir(parents=True, exist_ok=True)
+        failed_path = failed_dir / temp_processing_path.name
         shutil.move(str(temp_processing_path), str(failed_path))
         logger.error(f"Failed to process '{source_path.name}'. Moved to failed/. Error: {last_error}")
         return ProcessResult(
@@ -321,5 +372,6 @@ def process_single_video(
             trimmed_info=trimmed_str,
             zoom_info=f"Zoom: {builder.zoom:.3f}x",
             speed_info=speed_info_str,
+            profile_name=profile_name,
             error_message=last_error,
         )

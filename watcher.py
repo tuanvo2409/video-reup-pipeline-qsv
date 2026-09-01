@@ -28,16 +28,22 @@ logging.basicConfig(
 logger = logging.getLogger("VideoPipeline.Watcher")
 
 def scan_input_files() -> List[Path]:
-    """Scan the input directory for supported video files."""
+    """Scan the input directory and all channel subdirectories for supported video files."""
     if not config.input_dir.exists():
         return []
-    return [
-        p for p in config.input_dir.iterdir()
-        if p.is_file() and p.suffix.lower() in config.supported_extensions
-    ]
+    found: List[Path] = []
+    for item in config.input_dir.iterdir():
+        if item.is_file() and item.suffix.lower() in config.supported_extensions:
+            found.append(item)
+        elif item.is_dir() and not item.name.startswith("."):
+            for sub_item in item.rglob("*"):
+                if sub_item.is_file() and sub_item.suffix.lower() in config.supported_extensions:
+                    found.append(sub_item)
+    return found
 
 def run_batch(
     max_workers: int = 2,
+    override_profile: Optional[str] = None,
     override_encoder: Optional[str] = None,
     override_mode: Optional[str] = None,
     enable_mask: Optional[bool] = None,
@@ -58,9 +64,8 @@ def run_batch(
     send_to_dubvi: Optional[bool] = None,
     force_reprocess: bool = False,
 ) -> None:
-    """Process all available videos in the input directory in parallel with Smart Cache."""
+    """Process all available videos in the input directory and sub-channels in parallel with Smart Cache."""
     config.ensure_dirs()
-    # Startup Stale Cache & Temp Cleanup
     cleanup_stale_processing()
 
     files = scan_input_files()
@@ -70,7 +75,7 @@ def run_batch(
         return
 
     layout = override_mode or config.layout_mode
-    logger.info(f"=== Starting Batch Processing: {len(files)} files | Workers: {max_workers} | Mode: {layout} ===")
+    logger.info(f"=== Starting Multi-Channel Batch: {len(files)} files | Workers: {max_workers} | Mode: {layout} ===")
     start_batch_time = time.time()
 
     results: List[ProcessResult] = []
@@ -79,6 +84,7 @@ def run_batch(
             executor.submit(
                 process_single_video,
                 f,
+                override_profile,
                 override_encoder,
                 override_mode,
                 enable_mask,
@@ -109,19 +115,23 @@ def run_batch(
             if res.cache_hit:
                 status_str = "CACHE_HIT"
             dubvi_tag = " -> [DUBVI Ready]" if res.dubvi_forwarded else ""
-            logger.info(f"[{status_str}] Finished '{res.input_file.name}' in {res.duration_seconds:.2f}s | {res.vpdq_score_info or ''}{dubvi_tag}")
+            logger.info(
+                f"[{status_str}] [{res.profile_name}] Finished '{res.input_file.name}' in {res.duration_seconds:.2f}s | "
+                f"{res.vpdq_score_info or ''}{dubvi_tag}"
+            )
 
     total_time = time.time() - start_batch_time
     success_count = sum(1 for r in results if r.success)
     failed_count = len(results) - success_count
 
-    logger.info("=== Batch Summary ===")
+    logger.info("=== Multi-Channel Batch Summary ===")
     logger.info(f"Total: {len(results)} | Success: {success_count} | Failed: {failed_count}")
     logger.info(f"Total Time: {total_time:.2f}s | Avg Time: {total_time/max(1, len(results)):.2f}s/video")
 
 def run_watch_daemon(
     poll_interval: int = 3,
     max_workers: int = 2,
+    override_profile: Optional[str] = None,
     override_encoder: Optional[str] = None,
     override_mode: Optional[str] = None,
     enable_mask: Optional[bool] = None,
@@ -142,25 +152,26 @@ def run_watch_daemon(
     send_to_dubvi: Optional[bool] = None,
     force_reprocess: bool = False,
 ) -> None:
-    """Watch the input directory continuously and process files as they arrive."""
+    """Watch the input directory and all channel subdirectories continuously."""
     config.ensure_dirs()
     cleanup_stale_processing()
 
     layout = override_mode or config.layout_mode
-    logger.info(f"=== Daemon Watcher Started (Polling every {poll_interval}s | Workers: {max_workers} | Mode: {layout}) ===")
-    logger.info(f"Drop video files into '{config.input_dir.resolve()}' to process.")
+    logger.info(f"=== Multi-Channel Daemon Started (Polling every {poll_interval}s | Workers: {max_workers} | Mode: {layout}) ===")
+    logger.info(f"Drop video files into '{config.input_dir.resolve()}' or subfolders to process.")
     logger.info("Press Ctrl+C to stop.")
 
     try:
         while True:
             files = scan_input_files()
             if files:
-                logger.info(f"Detected {len(files)} new file(s). Dispatching to queue...")
+                logger.info(f"Detected {len(files)} new file(s) across channels. Dispatching to queue...")
                 with ThreadPoolExecutor(max_workers=max_workers) as executor:
                     futures = [
                         executor.submit(
                             process_single_video,
                             f,
+                            override_profile,
                             override_encoder,
                             override_mode,
                             enable_mask,
@@ -191,17 +202,23 @@ def run_watch_daemon(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="High-Performance Video Pipeline with Smart Cache, PySceneDetect, vPDQ, and Intel QSV"
+        description="High-Performance Multi-Channel Video Pipeline with Smart Cache, PySceneDetect, vPDQ, and Intel QSV"
     )
     parser.add_argument(
         "--watch",
         action="store_true",
-        help="Run continuously in watcher mode, processing files as they are placed in input/"
+        help="Run continuously in watcher mode, processing files as they are placed in input/ or subfolders"
     )
     parser.add_argument(
         "--batch",
         action="store_true",
-        help="Run once over all files in input/ and exit"
+        help="Run once over all files in input/ and subfolders, then exit"
+    )
+    parser.add_argument(
+        "--profile",
+        type=str,
+        default=None,
+        help="Force a specific channel profile name for all processed videos"
     )
     parser.add_argument(
         "--force",
@@ -243,12 +260,6 @@ def main():
         type=float,
         default=None,
         help="Set exact video+audio speedup multiplier (e.g. 1.15)"
-    )
-    parser.add_argument(
-        "--tempo",
-        type=float,
-        default=None,
-        help="Alias for --speed"
     )
     parser.add_argument(
         "--zoom",
@@ -382,10 +393,10 @@ def main():
     enable_smart_scenes = False if args.no_scenes else None
     enable_trim = False if args.no_trim else None
     send_to_dubvi = True if args.to_dubvi else None
-    speed_val = args.speed if args.speed is not None else args.tempo
 
     params = {
         "max_workers": args.workers,
+        "override_profile": args.profile,
         "override_encoder": args.encoder,
         "override_mode": args.mode,
         "enable_mask": enable_mask,
@@ -398,7 +409,7 @@ def main():
         "enable_jitter": enable_jitter,
         "enable_smart_scenes": enable_smart_scenes,
         "enable_tempo": enable_tempo,
-        "custom_tempo": speed_val,
+        "custom_tempo": args.speed,
         "custom_zoom": args.zoom,
         "enable_trim": enable_trim,
         "custom_trim_start": args.trim_start,

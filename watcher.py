@@ -10,6 +10,7 @@ from pipeline.config import config
 from pipeline.hardware import detect_best_encoder
 from pipeline.processor import process_single_video, ProcessResult
 from pipeline.vpdq_scorer import score_video_pair
+from pipeline.platform_presets import PLATFORM_PRESETS
 from pipeline.cache_manager import (
     cleanup_stale_processing,
     clear_cache_history,
@@ -44,6 +45,7 @@ def scan_input_files() -> List[Path]:
 def run_batch(
     max_workers: int = 2,
     override_profile: Optional[str] = None,
+    target_platform: Optional[str] = None,
     override_encoder: Optional[str] = None,
     override_mode: Optional[str] = None,
     enable_mask: Optional[bool] = None,
@@ -75,7 +77,8 @@ def run_batch(
         return
 
     layout = override_mode or config.layout_mode
-    logger.info(f"=== Starting Multi-Channel Batch: {len(files)} files | Workers: {max_workers} | Mode: {layout} ===")
+    plat_str = target_platform or "Universal"
+    logger.info(f"=== Starting Multi-Channel Batch: {len(files)} files | Platform: {plat_str} | Workers: {max_workers} ===")
     start_batch_time = time.time()
 
     results: List[ProcessResult] = []
@@ -85,6 +88,7 @@ def run_batch(
                 process_single_video,
                 f,
                 override_profile,
+                target_platform,
                 override_encoder,
                 override_mode,
                 enable_mask,
@@ -116,7 +120,7 @@ def run_batch(
                 status_str = "CACHE_HIT"
             dubvi_tag = " -> [DUBVI Ready]" if res.dubvi_forwarded else ""
             logger.info(
-                f"[{status_str}] [{res.profile_name}] Finished '{res.input_file.name}' in {res.duration_seconds:.2f}s | "
+                f"[{status_str}] [{res.profile_name} | {res.platform_name}] Finished '{res.input_file.name}' in {res.duration_seconds:.2f}s | "
                 f"{res.vpdq_score_info or ''}{dubvi_tag}"
             )
 
@@ -132,6 +136,7 @@ def run_watch_daemon(
     poll_interval: int = 3,
     max_workers: int = 2,
     override_profile: Optional[str] = None,
+    target_platform: Optional[str] = None,
     override_encoder: Optional[str] = None,
     override_mode: Optional[str] = None,
     enable_mask: Optional[bool] = None,
@@ -172,6 +177,7 @@ def run_watch_daemon(
                             process_single_video,
                             f,
                             override_profile,
+                            target_platform,
                             override_encoder,
                             override_mode,
                             enable_mask,
@@ -202,7 +208,7 @@ def run_watch_daemon(
 
 def main():
     parser = argparse.ArgumentParser(
-        description="High-Performance Multi-Channel Video Pipeline with Smart Cache, PySceneDetect, vPDQ, and Intel QSV"
+        description="High-Performance Multi-Platform Video Pipeline with Smart Cache, PySceneDetect, vPDQ, and Intel QSV"
     )
     parser.add_argument(
         "--watch",
@@ -213,6 +219,13 @@ def main():
         "--batch",
         action="store_true",
         help="Run once over all files in input/ and subfolders, then exit"
+    )
+    parser.add_argument(
+        "--platform",
+        type=str,
+        default=None,
+        choices=["universal", "tiktok", "facebook", "shorts", "instagram"],
+        help="Target platform preset: 'universal', 'tiktok', 'facebook', 'shorts', 'instagram'"
     )
     parser.add_argument(
         "--profile",
@@ -397,6 +410,7 @@ def main():
     params = {
         "max_workers": args.workers,
         "override_profile": args.profile,
+        "target_platform": args.platform,
         "override_encoder": args.encoder,
         "override_mode": args.mode,
         "enable_mask": enable_mask,

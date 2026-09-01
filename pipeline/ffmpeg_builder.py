@@ -3,9 +3,10 @@ from pathlib import Path
 from typing import List, Optional, Tuple
 from pipeline.config import config
 from pipeline.hardware import detect_best_encoder, get_encoder_args
+from pipeline.platform_presets import PlatformPreset, get_platform_preset
 
 class FFmpegCommandBuilder:
-    """Builds robust, single-pass FFmpeg commands with PySceneDetect nonlinear speedup, vPDQ perturbation, and Intel QSV."""
+    """Builds robust, single-pass FFmpeg commands with Multi-Platform Adaptive Presets, PySceneDetect speedup, and Intel QSV."""
 
     def __init__(
         self,
@@ -33,6 +34,7 @@ class FFmpegCommandBuilder:
         trim_start: float = 0.0,
         trim_end: Optional[float] = None,
         scene_schedule: Optional[List[Tuple[float, float, float]]] = None,
+        platform_preset: Optional[PlatformPreset] = None,
     ):
         self.input_path = input_path
         self.output_path = output_path
@@ -44,6 +46,7 @@ class FFmpegCommandBuilder:
         self.invisible_mask_path = invisible_mask_path or (
             config.default_watermark if config.default_watermark.exists() else None
         )
+        self.platform_preset = platform_preset or get_platform_preset("universal")
 
         self.layout_mode = layout_mode or config.layout_mode
         self.encoder = encoder or detect_best_encoder()
@@ -51,7 +54,12 @@ class FFmpegCommandBuilder:
         self.enable_mask = config.enable_mask if enable_mask is None else enable_mask
         self.mask_ratio = mask_ratio if mask_ratio is not None else config.mask_bottom_ratio
         self.enable_frame = config.enable_frame if enable_frame is None else enable_frame
-        self.enable_hflip = config.enable_hflip if enable_hflip is None else enable_hflip
+        
+        # Determine HFlip
+        if enable_hflip is not None:
+            self.enable_hflip = enable_hflip
+        else:
+            self.enable_hflip = self.platform_preset.enable_hflip_default or config.enable_hflip
 
         self.enable_invisible_mask = (
             config.enable_invisible_mask
@@ -70,6 +78,13 @@ class FFmpegCommandBuilder:
 
         self.trim_start = trim_start
         self.trim_end = trim_end
+        
+        # Enforce max duration limit for platforms like YouTube Shorts (<= 58.5s)
+        if self.platform_preset.max_duration_seconds:
+            max_d = self.platform_preset.max_duration_seconds
+            if self.trim_end is None or (self.trim_end - self.trim_start > max_d):
+                self.trim_end = self.trim_start + max_d
+
         self.scene_schedule = scene_schedule
 
         # Randomize subtle zoom factor (1.02x to 1.05x) centered
@@ -78,21 +93,24 @@ class FFmpegCommandBuilder:
         else:
             self.zoom = round(random.uniform(config.zoom_min, config.zoom_max), 3)
 
-        # Video & Audio Speedup (1.10x to 1.20x)
+        # Video & Audio Speedup
+        speed_bias = self.platform_preset.speed_multiplier_bias
         if custom_tempo:
             self.speed = custom_tempo
         elif self.enable_tempo:
-            self.speed = round(random.uniform(config.tempo_min, config.tempo_max), 3)
+            self.speed = round(random.uniform(config.tempo_min, config.tempo_max) + speed_bias, 3)
         else:
-            self.speed = 1.0
+            self.speed = 1.0 + speed_bias
 
-        # Randomize color jitter values
+        # Randomize color jitter values with platform biases
         if self.enable_jitter:
-            self.contrast = round(random.uniform(*config.jitter_contrast_range), 3)
-            self.saturation = round(random.uniform(*config.jitter_saturation_range), 3)
-            self.brightness = round(random.uniform(*config.jitter_brightness_range), 3)
+            self.contrast = round(random.uniform(*config.jitter_contrast_range) * self.platform_preset.contrast_bias, 3)
+            self.saturation = round(random.uniform(*config.jitter_saturation_range) * self.platform_preset.saturation_bias, 3)
+            self.brightness = round(random.uniform(*config.jitter_brightness_range) + self.platform_preset.brightness_bias, 3)
         else:
-            self.contrast, self.saturation, self.brightness = 1.0, 1.0, 0.0
+            self.contrast = round(1.0 * self.platform_preset.contrast_bias, 3)
+            self.saturation = round(1.0 * self.platform_preset.saturation_bias, 3)
+            self.brightness = round(0.0 + self.platform_preset.brightness_bias, 3)
 
     def build_command(self) -> List[str]:
         """Construct the complete single-pass FFmpeg command line arguments list."""
@@ -145,7 +163,6 @@ class FFmpegCommandBuilder:
         # 0. PySceneDetect Nonlinear Speed Modulation or Global Trim+Speedup
         # ----------------------------------------------------------------------
         if self.scene_schedule and len(self.scene_schedule) > 1:
-            # Segment-by-segment nonlinear temporal warping
             scene_v_tags = []
             scene_a_tags = []
             for idx, (s_start, s_end, s_spd) in enumerate(self.scene_schedule):
@@ -163,7 +180,6 @@ class FFmpegCommandBuilder:
                 f"{concat_scene_inputs}concat=n={len(self.scene_schedule)}:v=1:a=1[v_trimmed][a_trimmed]"
             )
         else:
-            # Standard Global Head & Tail Trimming + Uniform Speedup
             v_trim_filters = []
             a_trim_filters = []
 
@@ -179,8 +195,7 @@ class FFmpegCommandBuilder:
 
             if self.speed != 1.0:
                 v_trim_filters.append(f"setpts=(PTS-STARTPTS)/{self.speed:.4f}")
-                a_trim_filters.append("asetpts=PTS-STARTPTS")
-                a_trim_filters.append(f"atempo={self.speed:.4f}")
+                a_trim_filters.extend(["asetpts=PTS-STARTPTS", f"atempo={self.speed:.4f}"])
             else:
                 v_trim_filters.append("setpts=PTS-STARTPTS")
                 a_trim_filters.append("asetpts=PTS-STARTPTS")
@@ -194,7 +209,7 @@ class FFmpegCommandBuilder:
         a_in_label = "a_trimmed"
 
         # ----------------------------------------------------------------------
-        # 1. Main Video Layout & Visual Anti-Fingerprint
+        # 1. Main Video Scale & Crop (9:16 layout) & Post Filters
         # ----------------------------------------------------------------------
         post_filters = []
         if self.enable_hflip:
@@ -203,24 +218,22 @@ class FFmpegCommandBuilder:
             post_filters.append(
                 f"eq=contrast={self.contrast}:brightness={self.brightness}:saturation={self.saturation}"
             )
-        if self.enable_grain:
-            post_filters.append(f"noise=alls={config.grain_strength}:allf=t+u")
+        
+        # Platform-specific unsharp filter (TikTok / Shorts)
+        if self.platform_preset.unsharp_filter:
+            post_filters.append(self.platform_preset.unsharp_filter)
 
-        # Custom Border lines ONLY if explicitly enabled
-        if self.enable_frame and frame_idx is None and config.frame_border_width > 0:
-            bw = config.frame_border_width
-            bc = config.frame_border_color
-            post_filters.append(
-                f"drawbox=x=0:y=0:w=iw:h={bw}:color={bc}:t=fill,"
-                f"drawbox=x=0:y=ih-{bw}:w=iw:h={bw}:color={bc}:t=fill,"
-                f"drawbox=x=0:y=0:w={bw}:h=ih:color={bc}:t=fill,"
-                f"drawbox=x=iw-{bw}:y=0:w={bw}:h=ih:color={bc}:t=fill"
-            )
+        # Platform-specific color balance (Instagram warm tone)
+        if self.platform_preset.colorbalance_filter:
+            post_filters.append(self.platform_preset.colorbalance_filter)
+
+        if self.enable_grain:
+            eff_grain = max(1, config.grain_strength + self.platform_preset.grain_strength_bias)
+            post_filters.append(f"noise=alls={eff_grain}:allf=t+u")
 
         post_filters_str = ("," + ",".join(post_filters)) if post_filters else ""
 
         if self.layout_mode == "blur_pip":
-            # Smart Blur Background PiP mode
             filter_complex_parts.append(
                 f"[{v_in_label}]split=2[v_bg_src][v_fg_src];"
                 f"[v_bg_src]scale={config.target_width}:{config.target_height}:force_original_aspect_ratio=increase:flags={config.scale_flags},"
@@ -239,7 +252,6 @@ class FFmpegCommandBuilder:
                 f"[v_bg]{fg_label}overlay=(W-w)/2:(H-h)/2,fps={config.target_fps}{post_filters_str},format=yuv420p[v_main_base]"
             )
         else:
-            # Default crop_fill: Zoom slightly + Scale to fill 1080x1920 + Center crop (NO black borders!)
             scaled_w = int(config.target_width * self.zoom)
             scaled_h = int(config.target_height * self.zoom)
 
@@ -280,20 +292,22 @@ class FFmpegCommandBuilder:
             )
             current_main_v = "[v_framed]"
 
-        # Mascot Overlay
+        # Mascot / Brand Logo Overlay (with Safe Zone margin)
         if mascot_idx is not None:
+            safe_bottom_ratio = max(0.18, self.platform_preset.safe_zone_bottom_ratio)
             filter_complex_parts.append(
                 f"[{mascot_idx}:v]scale=280:-1[v_mascot];"
-                f"{current_main_v}[v_mascot]overlay=x=main_w-overlay_w-30:y=main_h*0.82-overlay_h-20:format=auto:shortest=1[v_main_overlay]"
+                f"{current_main_v}[v_mascot]overlay=x=main_w-overlay_w-30:y=main_h*(1.0-{safe_bottom_ratio:.2f})-overlay_h:format=auto:shortest=1[v_main_overlay]"
             )
             current_main_v = "[v_main_overlay]"
 
         # ----------------------------------------------------------------------
-        # 3. Audio Transformations & BGM Layering
+        # 3. Audio Transformations & EBU R128 Loudnorm Mastering
         # ----------------------------------------------------------------------
         audio_filters = [
             f"aresample={config.audio_sample_rate}",
-            "aformat=sample_fmts=fltp:channel_layouts=stereo"
+            "aformat=sample_fmts=fltp:channel_layouts=stereo",
+            f"loudnorm=I={self.platform_preset.target_lufs}:TP={self.platform_preset.true_peak}:LRA=11"
         ]
 
         filter_complex_parts.append(f"[{a_in_label}]{','.join(audio_filters)}[a_main_processed]")
@@ -331,40 +345,34 @@ class FFmpegCommandBuilder:
             segments_v.append("[v_outro]")
             segments_a.append("[a_outro]")
 
-        final_v_label = "[final_v]"
-        final_a_label = "[final_a]"
-
         if len(segments_v) > 1:
             concat_inputs = "".join([f"{v}{a}" for v, a in zip(segments_v, segments_a)])
             filter_complex_parts.append(
-                f"{concat_inputs}concat=n={len(segments_v)}:v=1:a=1{final_v_label}{final_a_label}"
+                f"{concat_inputs}concat=n={len(segments_v)}:v=1:a=1[v_final][a_final]"
             )
+            final_v = "[v_final]"
+            final_a = "[a_final]"
         else:
-            final_v_label = current_main_v
-            final_a_label = current_main_a
+            final_v = current_main_v
+            final_a = current_main_a
 
-        # Join full filter_complex
-        full_filter_complex = ";".join(filter_complex_parts)
-        cmd.extend(["-filter_complex", full_filter_complex])
+        # Join full filter graph string
+        filter_complex_str = ";".join(filter_complex_parts)
+        cmd.extend(["-filter_complex", filter_complex_str])
+        cmd.extend(["-map", final_v, "-map", final_a])
 
-        # Map streams
-        cmd.extend(["-map", final_v_label, "-map", final_a_label])
+        # Hardware Encoding Arguments
+        encoder_args = get_encoder_args(self.encoder)
+        cmd.extend(encoder_args)
 
-        # Video Encoder options
-        cmd.extend(get_encoder_args(self.encoder))
-
-        # Audio encoder options
         cmd.extend([
             "-c:a", "aac",
             "-b:a", config.audio_bitrate,
             "-ar", str(config.audio_sample_rate),
-            "-ac", str(config.audio_channels)
+            "-ac", str(config.audio_channels),
+            "-map_metadata", "-1",
+            "-movflags", "+faststart",
+            str(self.output_path)
         ])
-
-        # Wipe Metadata
-        cmd.extend(["-map_metadata", "-1", "-map_chapters", "-1"])
-
-        # Output path
-        cmd.append(str(self.output_path))
 
         return cmd

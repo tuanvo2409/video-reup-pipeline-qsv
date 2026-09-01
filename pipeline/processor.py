@@ -149,7 +149,7 @@ def process_single_video(
             )
 
     # 2. Move from input to processing
-    temp_filename = f"{profile_name}_{platform_preset.name}_{source_path.name}" if profile_name != "default" else source_path.name
+    temp_filename = f"{profile_name}_{platform_preset.name}_{source_path.name}"
     temp_processing_path = config.processing_dir / temp_filename
     try:
         shutil.move(str(source_path), str(temp_processing_path))

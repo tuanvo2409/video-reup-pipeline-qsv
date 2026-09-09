@@ -20,6 +20,7 @@ from pipeline.cache_manager import (
     record_processed_video,
     get_file_md5_quick,
 )
+from pipeline.dubvi_handoff import HandoffPublicationError, publish_dubvi_handoff
 
 logger = logging.getLogger("VideoPipeline.Processor")
 
@@ -42,6 +43,7 @@ class ProcessResult:
     platform_name: str = "universal"
     cache_hit: bool = False
     dubvi_forwarded: bool = False
+    handoff_error: Optional[str] = None
     error_message: Optional[str] = None
 
 def get_video_duration(file_path: Path) -> float:
@@ -102,7 +104,8 @@ def process_single_video(
     Process a single video with Multi-Profile and Platform-Adaptive Preset support.
     """
     start_time = time.time()
-    config.ensure_dirs()
+    do_send_dubvi = config.auto_send_to_dubvi if send_to_dubvi is None else send_to_dubvi
+    config.ensure_dirs(include_dubvi=do_send_dubvi)
 
     # Determine channel profile from subfolder or override
     profile_name = "default"
@@ -311,11 +314,16 @@ def process_single_video(
             "output_filename": final_output_path.name,
             "original_md5": original_md5,
             "output_md5": new_md5,
-            "duration_seconds": round(duration, 2),
+            "duration_seconds": round(total_duration, 2),
+            "processing_seconds": round(duration, 2),
             "zoom_factor": round(builder.zoom, 4),
             "horizontal_flip": builder.enable_hflip,
             "invisible_mask_opacity": effective_inv_opacity,
             "loudnorm_target_lufs": platform_preset.target_lufs,
+            "encoder_used": encoder,
+            "layout_mode": layout,
+            "speed_info": speed_info_str,
+            "trimmed_info": trimmed_str,
             "vpdq_similarity_percent": vpdq_score_val,
             "vpdq_status": vpdq_status_val,
             "processed_at": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -338,18 +346,17 @@ def process_single_video(
         )
 
         # Auto forward to DUBVI media folder if requested
-        do_send_dubvi = config.auto_send_to_dubvi if send_to_dubvi is None else send_to_dubvi
         dubvi_forwarded = False
+        handoff_error = None
         if do_send_dubvi:
             try:
                 target_dubvi_dir = config.dubvi_media_dir / profile_name if profile_name != "default" else config.dubvi_media_dir
-                target_dubvi_dir.mkdir(parents=True, exist_ok=True)
-                dest_dubvi_file = target_dubvi_dir / final_output_path.name
-                shutil.copy2(str(final_output_path), str(dest_dubvi_file))
+                publication = publish_dubvi_handoff(final_output_path, meta_data, target_dubvi_dir)
                 dubvi_forwarded = True
-                logger.info(f"-> [DUBVI Bridge] Auto-copied to DUBVI folder: '{profile_name}/{dest_dubvi_file.name}'")
-            except Exception as e:
-                logger.warning(f"Failed to copy to DUBVI media dir: {e}")
+                logger.info(f"-> [DUBVI Bridge] Published complete sidecar: '{profile_name}/{publication.video_path.name}'")
+            except HandoffPublicationError as e:
+                handoff_error = str(e)
+                logger.warning(f"DUBVI bridge was not published: {handoff_error}")
 
         logger.info(
             f"Successfully processed: [{profile_name} | {platform_preset.name}] '{final_output_path.name}' in {duration:.2f}s "
@@ -371,6 +378,7 @@ def process_single_video(
             profile_name=profile_name,
             platform_name=platform_preset.name,
             dubvi_forwarded=dubvi_forwarded,
+            handoff_error=handoff_error,
         )
     else:
         failed_dir = config.failed_dir / profile_name if profile_name != "default" else config.failed_dir

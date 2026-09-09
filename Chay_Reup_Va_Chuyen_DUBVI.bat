@@ -6,7 +6,7 @@ color 0B
 echo ===============================================================================
 echo   🚀 HỆ THỐNG LIÊN HOÀN 2 GIAI ĐOẠN: VIDEO PIP  ==^>  DUBVI AI
 echo   • Giai đoạn 1: Bẻ gãy mã băm vPDQ + Render siêu tốc QSV
-echo   • Chuyển tiếp: Tự động copy sang thư mục 'C:\Users\vmath\Videos\douyin'
+echo   • Chuyển tiếp: Tự động publish video + metadata sang DUBVI_MEDIA_DIR đã cấu hình
 echo   • Giai đoạn 2: Sẵn sàng để DUBVI Dịch thuật, Lồng tiếng CapCut & Dán Sub
 echo ===============================================================================
 echo.
@@ -23,5 +23,4 @@ echo   • Bạn có thể mở DUBVI Studio hoặc DUBVI Worker để dịch v�
 echo ===============================================================================
 echo.
 
-explorer "C:\Users\vmath\Videos\douyin"
 pause

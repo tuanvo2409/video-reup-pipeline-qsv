@@ -288,7 +288,7 @@ def main():
     parser.add_argument(
         "--to-dubvi",
         action="store_true",
-        help="Auto copy rendered video to DUBVI media directory (C:/Users/vmath/Videos/douyin)"
+        help="Publish rendered video and complete metadata sidecar to configured DUBVI_MEDIA_DIR"
     )
     parser.add_argument(
         "--no-scenes",

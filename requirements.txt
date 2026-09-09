@@ -1,3 +1,2 @@
-# Python Standard Library handles all core features (pathlib, subprocess, concurrent.futures, hashlib, logging)
-# Optional enhancements:
-tqdm>=4.66.0
+# The reup pipeline uses only the Python standard library.
+# FFmpeg and ffprobe are required external executables, not Python packages.

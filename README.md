@@ -34,9 +34,22 @@ Hệ thống tự động hóa xử lý và lách bản quyền video ngắn (9:
 
 Chỉ cần **Nhấp đúp chuột** vào các file `.bat`:
 
-* 🟢 **`Chay_Reup_Sieu_Toc.bat`**: Xử lý toàn bộ video trong `input/` $\rightarrow$ Tự động mở thư mục `video reup raw` khi xong.
+* 🟢 **`Chay_Reup_Sieu_Toc.bat`**: Xử lý toàn bộ video trong `input/` và ghi vào `REUP_OUTPUT_DIR` đã cấu hình.
 * 🔵 **`Chay_Reup_Va_Chuyen_DUBVI.bat`**: Xử lý video và tự động chuyển sang thư mục của **DUBVI** để làm Giai đoạn 2 (Dịch thuật + Lồng tiếng CapCut).
 * 🟡 **`Chay_Ngam_Tu_Dong_24_7.bat`**: Chế độ tự động chạy ngầm 24/7.
+
+---
+
+## 📁 Cấu Hình Đường Dẫn
+
+Mặc định, output và DUBVI bridge nằm trong repository (`output/` và `dubvi-media/`). Có thể đặt hai biến môi trường trước khi chạy để dùng các vị trí khác:
+
+```powershell
+$env:REUP_OUTPUT_DIR = "<absolute output directory>"
+$env:DUBVI_MEDIA_DIR = "<absolute DUBVI media directory>"
+```
+
+`--to-dubvi` chỉ tạo/sử dụng `DUBVI_MEDIA_DIR` khi một handoff được yêu cầu. Mỗi handoff hoàn chỉnh gồm video và file `.meta.json` cùng tên; sidecar có `handoff_schema_version: 1` và `handoff_status: "complete"`.
 
 ---
 

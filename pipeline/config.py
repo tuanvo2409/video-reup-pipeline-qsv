@@ -6,14 +6,21 @@ from typing import List, Literal
 # Base workspace directory
 BASE_DIR = Path(__file__).resolve().parent.parent
 
+
+def _path_from_env(name: str, default: Path) -> Path:
+    """Read an optional filesystem location without coupling the pipeline to a Windows account."""
+    value = os.getenv(name)
+    return Path(value).expanduser() if value else default
+
+
 @dataclass
 class PipelineConfig:
     """System configuration for video pipeline processing."""
     # Directory paths
     input_dir: Path = BASE_DIR / "input"
     processing_dir: Path = BASE_DIR / "processing"
-    # Output directory - Updated to user's desired folder
-    output_dir: Path = Path(r"C:\Users\vmath\Downloads\douyinnnnnnnnnnn\video reup raw")
+    # Output is portable by default and can be redirected for an installed worker.
+    output_dir: Path = field(default_factory=lambda: _path_from_env("REUP_OUTPUT_DIR", BASE_DIR / "output"))
     failed_dir: Path = BASE_DIR / "failed"
     assets_dir: Path = BASE_DIR / "assets"
     mascots_dir: Path = BASE_DIR / "assets" / "mascots"
@@ -25,8 +32,9 @@ class PipelineConfig:
     default_watermark: Path = BASE_DIR / "assets" / "watermarks" / "default_invisible_mask.jpg"
     log_file: Path = BASE_DIR / "system.log"
 
-    # DUBVI Bridge Directory (Giai đoạn 2)
-    dubvi_media_dir: Path = Path(r"C:\Users\vmath\Videos\douyin")
+    # DUBVI Bridge Directory (Giai đoạn 2). This intentionally shares the
+    # translator's existing DUBVI_MEDIA_DIR setting.
+    dubvi_media_dir: Path = field(default_factory=lambda: _path_from_env("DUBVI_MEDIA_DIR", BASE_DIR / "dubvi-media"))
     auto_send_to_dubvi: bool = False
 
     # Video output resolution (9:16 vertical standard)
@@ -109,9 +117,13 @@ class PipelineConfig:
     supported_audio_extensions: tuple = (".mp3", ".wav", ".aac", ".m4a", ".ogg", ".flac")
     supported_image_extensions: tuple = (".png", ".webp", ".jpg", ".jpeg")
 
-    def ensure_dirs(self) -> None:
-        """Ensure all required directories exist."""
-        for d in [
+    def ensure_dirs(self, include_dubvi: bool = False) -> None:
+        """Ensure configured working directories exist.
+
+        The bridge directory is created only for an explicit DUBVI handoff so
+        ordinary reup runs do not create an unrelated configured location.
+        """
+        directories = [
             self.input_dir,
             self.processing_dir,
             self.output_dir,
@@ -122,8 +134,10 @@ class PipelineConfig:
             self.bgm_dir,
             self.frames_dir,
             self.watermarks_dir,
-            self.dubvi_media_dir,
-        ]:
+        ]
+        if include_dubvi:
+            directories.append(self.dubvi_media_dir)
+        for d in directories:
             d.mkdir(parents=True, exist_ok=True)
 
 # Default global instance

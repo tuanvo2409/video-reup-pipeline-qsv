@@ -37,13 +37,12 @@ class AcceptedReupJob:
 def iter_reup_envelopes(input_root: Path) -> tuple[Path, ...]:
     """Return only final canonical envelopes in deterministic lexical order."""
 
-    if not input_root.is_dir() or input_root.is_symlink():
-        raise ReupIntakeError("configured Reup input root must be an existing non-symlink directory")
+    root = _require_input_root(input_root)
     paths = [
-        path for path in input_root.rglob("dubvi-reup-job-*.job.json")
+        path for path in root.rglob("dubvi-reup-job-*.job.json")
         if path.is_file() and not path.is_symlink() and path.name.startswith("dubvi-reup-job-")
     ]
-    return tuple(sorted(paths, key=lambda path: path.relative_to(input_root).as_posix()))
+    return tuple(sorted(paths, key=lambda path: path.relative_to(root).as_posix()))
 
 
 def accept_next_reup_job(
@@ -69,7 +68,8 @@ def accept_reup_envelope(
 ) -> AcceptedReupJob:
     """Validate an immutable CP envelope and publish only its accepted ACK."""
 
-    document = load_reup_envelope(envelope_path, input_root)
+    root = _require_input_root(input_root)
+    document = load_reup_envelope(envelope_path, root)
     media_path = envelope_path.parent / str(document["media_name"])
     _validate_media(media_path, envelope_path.parent, document)
     try:
@@ -82,7 +82,8 @@ def accept_reup_envelope(
 def load_reup_envelope(envelope_path: Path, input_root: Path) -> dict[str, object]:
     """Parse and validate one final canonical Reup envelope without side effects."""
 
-    _assert_under(input_root, envelope_path)
+    root = _require_input_root(input_root)
+    _assert_under(root, envelope_path)
     if envelope_path.is_symlink() or not envelope_path.is_file():
         raise ReupIntakeError("canonical Reup envelope must be a regular final file")
     size = envelope_path.stat().st_size
@@ -101,10 +102,18 @@ def load_reup_envelope(envelope_path: Path, input_root: Path) -> dict[str, objec
     expected = f"dubvi-reup-job-{document['reup_job_id']}.job.json"
     if envelope_path.name != expected:
         raise ReupIntakeError("envelope filename does not match its explicit reup_job_id")
-    expected_directory = input_root / profile / platform
+    expected_directory = root / profile / platform
     if envelope_path.parent.resolve() != expected_directory.resolve():
         raise ReupIntakeError("envelope path contradicts its authoritative profile/platform layout")
     return document
+
+
+def _require_input_root(input_root: Path) -> Path:
+    """Return only an existing real input root; canonical intake never creates it."""
+
+    if input_root.is_symlink() or not input_root.is_dir():
+        raise ReupIntakeError("configured Reup input root must be an existing non-symlink directory")
+    return input_root.resolve()
 
 
 def _validate_runtime_lineage(document: Mapping[str, object]) -> None:

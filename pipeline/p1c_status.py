@@ -72,13 +72,16 @@ def publish_accepted_status(
     try:
         os.link(stage, final)
     except FileExistsError:
-        _validate_existing(final, job)
-        return final
+        if _matches(final, payload):
+            _safe_remove_owned_stage(stage)
+            return final
+        _safe_remove_owned_stage(stage)
+        raise ReupStatusError("ENGINE_STATUS_CONFLICT: racing accepted status differs")
     except OSError as error:
         raise ReupStatusError(f"non-replacing accepted status publication failed: {error}") from error
     if not _matches(final, payload):
         raise ReupStatusError("published accepted status failed verification")
-    stage.unlink(missing_ok=True)
+    _safe_remove_owned_stage(stage)
     return final
 
 
@@ -109,6 +112,8 @@ def _validate_existing(path: Path, job: Mapping[str, object]) -> None:
         raise ReupStatusError("existing accepted status conflicts with canonical job identity")
     if document.get("parent_engine_job_id") != job.get("parent_reup_job_id"):
         raise ReupStatusError("existing accepted status conflicts with retry lineage")
+    if payload != canonical_json_bytes(document):
+        raise ReupStatusError("existing accepted status is not canonical bytes")
 
 
 def _stage_exact(path: Path, payload: bytes) -> None:
@@ -127,6 +132,15 @@ def _stage_exact(path: Path, payload: bytes) -> None:
         raise ReupStatusError("racing accepted status stage differs")
     if not _matches(path, payload):
         raise ReupStatusError("accepted status stage failed verification")
+
+
+def _safe_remove_owned_stage(path: Path) -> None:
+    """Best-effort removal of only this invocation's exact hidden stage."""
+
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        pass
 
 
 def _matches(path: Path, expected: bytes) -> bool:

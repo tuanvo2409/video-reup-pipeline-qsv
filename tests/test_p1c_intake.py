@@ -10,6 +10,7 @@ import unittest
 import uuid
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
@@ -17,7 +18,7 @@ if str(ROOT) not in sys.path:
 
 from pipeline.dubvi_engine_contract import canonical_json_bytes, validate_engine_status_event
 from pipeline.input_rules import is_legacy_media_input
-from pipeline.p1c_intake import ReupIntakeError, accept_next_reup_job
+from pipeline.p1c_intake import ReupIntakeError, accept_next_reup_job, accept_reup_envelope
 
 
 class P1CReupIntakeTests(unittest.TestCase):
@@ -121,8 +122,8 @@ class P1CReupIntakeTests(unittest.TestCase):
             accept_next_reup_job(self.root, self.status)
         self.assertTrue(self.status.is_file())
 
-    def test_symlink_status_root_is_rejected_when_supported(self) -> None:
-        self._write_envelope()
+    def test_symlink_roots_are_rejected_when_supported(self) -> None:
+        envelope = self._write_envelope()
         target = Path(self.temporary.name) / "real-status"
         target.mkdir()
         try:
@@ -131,6 +132,10 @@ class P1CReupIntakeTests(unittest.TestCase):
             self.skipTest("directory symlinks are unavailable in this test environment")
         with self.assertRaises(ReupIntakeError):
             accept_next_reup_job(self.root, self.status)
+        linked_root = Path(self.temporary.name) / "linked-input"
+        os.symlink(self.root, linked_root, target_is_directory=True)
+        with self.assertRaises(ReupIntakeError):
+            accept_reup_envelope(envelope, linked_root, Path(self.temporary.name) / "unused-status")
 
     def test_retry_status_copies_exact_parent_job_id(self) -> None:
         parent = str(uuid.uuid4())
@@ -149,6 +154,49 @@ class P1CReupIntakeTests(unittest.TestCase):
         self.assertFalse(is_legacy_media_input(self.media, (".mp4",)))
         self.assertFalse(is_legacy_media_input(nested, (".mp4",)))
         self.assertTrue(is_legacy_media_input(ordinary, (".mp4",)))
+
+    def test_direct_intake_requires_real_input_root(self) -> None:
+        envelope = self._write_envelope()
+        missing = Path(self.temporary.name) / "missing-root"
+        with self.assertRaises(ReupIntakeError):
+            accept_reup_envelope(envelope, missing, self.status)
+        file_root = Path(self.temporary.name) / "file-root"
+        file_root.write_text("not a directory", encoding="utf-8")
+        with self.assertRaises(ReupIntakeError):
+            accept_reup_envelope(envelope, file_root, self.status)
+        self.assertFalse(self.status.exists())
+
+    def test_status_race_requires_exact_canonical_bytes(self) -> None:
+        self._write_envelope()
+        from pipeline import p1c_status
+
+        def different_winner(stage: str | os.PathLike[str], final: str | os.PathLike[str]) -> None:
+            document = json.loads(Path(stage).read_text(encoding="utf-8"))
+            document["event_id"] = str(uuid.uuid4())
+            document["occurred_at_utc"] = "2026-09-10T13:02:00.000Z"
+            Path(final).write_bytes(canonical_json_bytes(document))
+            raise FileExistsError
+
+        with mock.patch.object(p1c_status.os, "link", side_effect=different_winner):
+            with self.assertRaises(ReupIntakeError):
+                accept_next_reup_job(self.root, self.status, occurred_at_utc="2026-09-10T13:01:00.000Z")
+        final = self.status / "reup" / self.job_id / "event-000001.json"
+        winner = json.loads(final.read_text(encoding="utf-8"))
+        self.assertEqual("2026-09-10T13:02:00.000Z", winner["occurred_at_utc"])
+        self.assertEqual([], list(final.parent.glob("event-000002.json")))
+
+    def test_status_race_reuses_only_exact_bytes(self) -> None:
+        self._write_envelope()
+        from pipeline import p1c_status
+
+        def exact_winner(stage: str | os.PathLike[str], final: str | os.PathLike[str]) -> None:
+            Path(final).write_bytes(Path(stage).read_bytes())
+            raise FileExistsError
+
+        with mock.patch.object(p1c_status.os, "link", side_effect=exact_winner):
+            accepted = accept_next_reup_job(self.root, self.status, occurred_at_utc="2026-09-10T13:01:00.000Z")
+        assert accepted is not None
+        self.assertEqual([], list(accepted.status_path.parent.glob("event-000002.json")))
 
 
 if __name__ == "__main__":

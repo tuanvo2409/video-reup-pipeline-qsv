@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -17,6 +18,10 @@ from pipeline.p1c_status import ReupStatusError, publish_accepted_status
 
 class ReupIntakeError(RuntimeError):
     """Raised when canonical Reup intake cannot fail closed."""
+
+
+MAX_REUP_JOB_ENVELOPE_BYTES = 64 * 1024
+_TARGET_PLATFORM_RE = re.compile(r"[a-z0-9]+(?:[a-z0-9-]*[a-z0-9])?")
 
 
 @dataclass(frozen=True)
@@ -80,17 +85,55 @@ def load_reup_envelope(envelope_path: Path, input_root: Path) -> dict[str, objec
     _assert_under(input_root, envelope_path)
     if envelope_path.is_symlink() or not envelope_path.is_file():
         raise ReupIntakeError("canonical Reup envelope must be a regular final file")
+    size = envelope_path.stat().st_size
+    if size <= 0 or size > MAX_REUP_JOB_ENVELOPE_BYTES:
+        raise ReupIntakeError("canonical Reup envelope has an unsafe size")
     try:
-        document = validate_control_plane_to_reup_job(parse_json_document(envelope_path.read_bytes()))
+        payload = envelope_path.read_bytes()
+        if len(payload) != size:
+            raise ReupIntakeError("canonical Reup envelope changed while read")
+        document = validate_control_plane_to_reup_job(parse_json_document(payload))
     except ContractValidationError as error:
         raise ReupIntakeError(f"invalid Control Plane Reup envelope: {error}") from error
+    _validate_runtime_lineage(document)
+    profile = _safe_profile_component(document["reup_profile"])
+    platform = _safe_target_platform(document["target_platform"])
     expected = f"dubvi-reup-job-{document['reup_job_id']}.job.json"
     if envelope_path.name != expected:
         raise ReupIntakeError("envelope filename does not match its explicit reup_job_id")
-    expected_directory = input_root / str(document["reup_profile"]) / str(document["target_platform"])
+    expected_directory = input_root / profile / platform
     if envelope_path.parent.resolve() != expected_directory.resolve():
         raise ReupIntakeError("envelope path contradicts its authoritative profile/platform layout")
     return document
+
+
+def _validate_runtime_lineage(document: Mapping[str, object]) -> None:
+    """Apply CP3's stricter runtime lineage rules above generic CP1 grammar."""
+
+    if "attempt_number" not in document:
+        raise ReupIntakeError("canonical Reup envelope requires attempt_number")
+    attempt = document["attempt_number"]
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        raise ReupIntakeError("canonical Reup envelope attempt_number must be positive")
+    parent_present = "parent_reup_job_id" in document
+    if attempt == 1 and parent_present:
+        raise ReupIntakeError("first canonical Reup attempt must not carry parent_reup_job_id")
+    if attempt > 1 and not parent_present:
+        raise ReupIntakeError("retry canonical Reup attempt requires parent_reup_job_id")
+
+
+def _safe_profile_component(value: object) -> str:
+    if not isinstance(value, str) or not value or value != value.strip() or value in {".", ".."}:
+        raise ReupIntakeError("reup_profile must be one nonblank safe path component")
+    if "\x00" in value or any(token in value for token in ("/", "\\", ":")) or Path(value).is_absolute():
+        raise ReupIntakeError("reup_profile must be one non-absolute safe path component")
+    return value
+
+
+def _safe_target_platform(value: object) -> str:
+    if not isinstance(value, str) or _TARGET_PLATFORM_RE.fullmatch(value) is None:
+        raise ReupIntakeError("target_platform must be a lowercase canonical safe component")
+    return value
 
 
 def _validate_media(media: Path, directory: Path, document: Mapping[str, object]) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import sys
 import unittest
 import uuid
@@ -85,6 +86,69 @@ class P1CReupIntakeTests(unittest.TestCase):
         with self.assertRaises(ReupIntakeError):
             accept_next_reup_job(self.root, self.status)
         self.assertEqual("{}", event_path.read_text(encoding="utf-8"))
+
+    def test_runtime_lineage_and_path_components_fail_before_status_write(self) -> None:
+        cases = (
+            ("missing-attempt", {"attempt_number": None}),
+            ("first-with-parent", {"parent_reup_job_id": str(uuid.uuid4())}),
+            ("retry-without-parent", {"attempt_number": 2}),
+            ("profile-traversal", {"reup_profile": "foo/../profile"}),
+            ("profile-dot", {"reup_profile": "profile/."}),
+            ("profile-backslash", {"reup_profile": "foo\\bar"}),
+            ("platform-unsafe", {"target_platform": "../tiktok"}),
+        )
+        for name, changes in cases:
+            with self.subTest(name=name):
+                self._write_envelope(**changes)
+                path = self.target / f"dubvi-reup-job-{self.job_id}.job.json"
+                if changes.get("attempt_number") is None:
+                    document = json.loads(path.read_text(encoding="utf-8"))
+                    document.pop("attempt_number")
+                    path.write_bytes(canonical_json_bytes(document))
+                with self.assertRaises(ReupIntakeError):
+                    accept_next_reup_job(self.root, self.status)
+                self.assertFalse(self.status.exists())
+
+    def test_oversized_envelope_and_invalid_status_root_fail_closed(self) -> None:
+        path = self._write_envelope()
+        path.write_bytes(b"{" + b" " * (64 * 1024) + b"}")
+        with self.assertRaises(ReupIntakeError):
+            accept_next_reup_job(self.root, self.status)
+        self.assertFalse(self.status.exists())
+        self._write_envelope()
+        self.status.write_text("not a directory", encoding="utf-8")
+        with self.assertRaises(ReupIntakeError):
+            accept_next_reup_job(self.root, self.status)
+        self.assertTrue(self.status.is_file())
+
+    def test_symlink_status_root_is_rejected_when_supported(self) -> None:
+        self._write_envelope()
+        target = Path(self.temporary.name) / "real-status"
+        target.mkdir()
+        try:
+            os.symlink(target, self.status, target_is_directory=True)
+        except (NotImplementedError, OSError):
+            self.skipTest("directory symlinks are unavailable in this test environment")
+        with self.assertRaises(ReupIntakeError):
+            accept_next_reup_job(self.root, self.status)
+
+    def test_retry_status_copies_exact_parent_job_id(self) -> None:
+        parent = str(uuid.uuid4())
+        self._write_envelope(attempt_number=2, parent_reup_job_id=parent)
+        accepted = accept_next_reup_job(self.root, self.status, occurred_at_utc="2026-09-10T13:01:00.000Z")
+        assert accepted is not None
+        event = validate_engine_status_event(json.loads(accepted.status_path.read_text(encoding="utf-8")))
+        self.assertEqual(2, event["attempt_number"])
+        self.assertEqual(parent, event["parent_engine_job_id"])
+
+    def test_legacy_filter_fences_root_and_nested_canonical_media(self) -> None:
+        nested = self.target / "dubvi-nested.mp4"
+        nested.write_bytes(b"x")
+        ordinary = self.target / "ordinary.mp4"
+        ordinary.write_bytes(b"x")
+        self.assertFalse(is_legacy_media_input(self.media, (".mp4",)))
+        self.assertFalse(is_legacy_media_input(nested, (".mp4",)))
+        self.assertTrue(is_legacy_media_input(ordinary, (".mp4",)))
 
 
 if __name__ == "__main__":

@@ -21,6 +21,9 @@ class ReupStatusError(RuntimeError):
     """Raised when accepted evidence cannot be safely published or reused."""
 
 
+MAX_REUP_STATUS_EVENT_BYTES = 64 * 1024
+
+
 def publish_accepted_status(
     status_root: Path,
     job: Mapping[str, object],
@@ -33,8 +36,11 @@ def publish_accepted_status(
     beyond the one immutable acceptance event.
     """
 
-    job_id = str(job["reup_job_id"])
-    dispatch_id = str(job["dispatch_id"])
+    attempt_number, parent_job_id = _runtime_lineage(job)
+    job_id = str(job.get("reup_job_id", ""))
+    dispatch_id = str(job.get("dispatch_id", ""))
+    if not job_id or not dispatch_id:
+        raise ReupStatusError("accepted status requires a validated job identity")
     event: dict[str, object] = {
         "contract_version": CONTRACT_VERSION,
         "message_kind": "engine_status_event",
@@ -44,18 +50,19 @@ def publish_accepted_status(
         "dispatch_id": dispatch_id,
         "correlation_id": dispatch_id,
         "sequence": 1,
-        "attempt_number": job["attempt_number"],
+        "attempt_number": attempt_number,
         "event_kind": "accepted",
         "state": "accepted",
         "occurred_at_utc": occurred_at_utc or _now_utc_millis(),
     }
-    if "parent_reup_job_id" in job:
-        event["parent_engine_job_id"] = job["parent_reup_job_id"]
+    if parent_job_id is not None:
+        event["parent_engine_job_id"] = parent_job_id
     document = validate_engine_status_event(event)
     payload = canonical_json_bytes(document)
-    directory = status_root / "reup" / job_id
+    root = _require_status_root(status_root)
+    directory = _require_status_subdirectory(root, "reup", job_id)
     final = directory / "event-000001.json"
-    _assert_under(status_root, final)
+    _assert_under(root, final)
     if final.exists() or final.is_symlink():
         _validate_existing(final, job)
         return final
@@ -78,8 +85,14 @@ def publish_accepted_status(
 def _validate_existing(path: Path, job: Mapping[str, object]) -> None:
     if path.is_symlink() or not path.is_file():
         raise ReupStatusError("existing accepted status is not a regular file")
+    size = path.stat().st_size
+    if size <= 0 or size > MAX_REUP_STATUS_EVENT_BYTES:
+        raise ReupStatusError("existing accepted status has an unsafe size")
     try:
-        document = validate_engine_status_event(parse_json_document(path.read_bytes()))
+        payload = path.read_bytes()
+        if len(payload) != size:
+            raise ReupStatusError("existing accepted status changed while read")
+        document = validate_engine_status_event(parse_json_document(payload))
     except Exception as error:
         raise ReupStatusError("existing accepted status is invalid") from error
     expected = {
@@ -129,6 +142,53 @@ def _matches(path: Path, expected: bytes) -> bool:
 def _now_utc_millis() -> str:
     value = datetime.now(timezone.utc)
     return value.strftime("%Y-%m-%dT%H:%M:%S.") + f"{value.microsecond // 1000:03d}Z"
+
+
+def _runtime_lineage(job: Mapping[str, object]) -> tuple[int, str | None]:
+    if "attempt_number" not in job:
+        raise ReupStatusError("canonical Reup job requires attempt_number")
+    attempt = job["attempt_number"]
+    if isinstance(attempt, bool) or not isinstance(attempt, int) or attempt < 1:
+        raise ReupStatusError("canonical Reup attempt_number must be positive")
+    parent = job.get("parent_reup_job_id")
+    if attempt == 1:
+        if parent is not None:
+            raise ReupStatusError("first canonical Reup job must not have a parent")
+        return attempt, None
+    if not isinstance(parent, str) or not parent:
+        raise ReupStatusError("retry canonical Reup job requires parent_reup_job_id")
+    return attempt, parent
+
+
+def _require_status_root(status_root: Path) -> Path:
+    if status_root.exists() or status_root.is_symlink():
+        if status_root.is_symlink() or not status_root.is_dir():
+            raise ReupStatusError("status_root must be a real non-symlink directory")
+    else:
+        try:
+            status_root.mkdir(parents=True, exist_ok=False)
+        except OSError as error:
+            raise ReupStatusError(f"cannot create status_root: {error}") from error
+        if status_root.is_symlink() or not status_root.is_dir():
+            raise ReupStatusError("created status_root is not a real directory")
+    return status_root.resolve()
+
+
+def _require_status_subdirectory(root: Path, *parts: str) -> Path:
+    directory = root.joinpath(*parts)
+    _assert_under(root, directory)
+    if directory.exists() or directory.is_symlink():
+        if directory.is_symlink() or not directory.is_dir():
+            raise ReupStatusError("status directory must be a real contained directory")
+    else:
+        try:
+            directory.mkdir(parents=True, exist_ok=False)
+        except OSError as error:
+            raise ReupStatusError(f"cannot create status directory: {error}") from error
+        if directory.is_symlink() or not directory.is_dir():
+            raise ReupStatusError("created status directory is not real")
+    _assert_under(root, directory)
+    return directory
 
 
 def _assert_under(root: Path, path: Path) -> None:

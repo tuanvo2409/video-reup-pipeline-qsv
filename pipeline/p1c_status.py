@@ -24,6 +24,33 @@ class ReupStatusError(RuntimeError):
 MAX_REUP_STATUS_EVENT_BYTES = 64 * 1024
 
 
+def inspect_existing_accepted_status(status_root: Path, job: Mapping[str, object]) -> Path | None:
+    """Return only valid, pre-existing sequence-one acceptance evidence.
+
+    This inspection is deliberately side-effect free so queue-style intake can
+    advance past completed immutable envelopes without creating a status root,
+    status directory, stage, or event.  A present but invalid record is an
+    authority conflict, never a reason to skip ahead.
+    """
+
+    _runtime_lineage(job)
+    job_id = str(job.get("reup_job_id", ""))
+    dispatch_id = str(job.get("dispatch_id", ""))
+    if not job_id or not dispatch_id:
+        raise ReupStatusError("accepted status requires a validated job identity")
+    if not status_root.exists() and not status_root.is_symlink():
+        return None
+    if status_root.is_symlink() or not status_root.is_dir():
+        raise ReupStatusError("status_root must be a real non-symlink directory")
+    root = status_root.resolve()
+    final = root / "reup" / job_id / "event-000001.json"
+    _assert_under(root, final)
+    if not final.exists() and not final.is_symlink():
+        return None
+    _validate_existing(final, job)
+    return final
+
+
 def publish_accepted_status(
     status_root: Path,
     job: Mapping[str, object],

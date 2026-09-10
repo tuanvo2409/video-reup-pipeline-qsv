@@ -13,7 +13,11 @@ from pipeline.dubvi_engine_contract import (
     parse_json_document,
     validate_control_plane_to_reup_job,
 )
-from pipeline.p1c_status import ReupStatusError, publish_accepted_status
+from pipeline.p1c_status import (
+    ReupStatusError,
+    inspect_existing_accepted_status,
+    publish_accepted_status,
+)
 
 
 class ReupIntakeError(RuntimeError):
@@ -51,12 +55,19 @@ def accept_next_reup_job(
     *,
     occurred_at_utc: str | None = None,
 ) -> AcceptedReupJob | None:
-    """Accept at most the first deterministic canonical envelope once."""
+    """Accept at most one pending canonical envelope in deterministic order."""
 
-    envelopes = iter_reup_envelopes(input_root)
-    if not envelopes:
-        return None
-    return accept_reup_envelope(envelopes[0], input_root, status_root, occurred_at_utc=occurred_at_utc)
+    root = _require_input_root(input_root)
+    for envelope in iter_reup_envelopes(root):
+        document = load_reup_envelope(envelope, root)
+        try:
+            existing = inspect_existing_accepted_status(status_root, document)
+        except ReupStatusError as error:
+            raise ReupIntakeError(f"canonical accepted status failed: {error}") from error
+        if existing is not None:
+            continue
+        return accept_reup_envelope(envelope, root, status_root, occurred_at_utc=occurred_at_utc)
+    return None
 
 
 def accept_reup_envelope(

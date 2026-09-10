@@ -49,7 +49,7 @@ class P1CReupIntakeTests(unittest.TestCase):
             "created_at_utc": "2026-09-10T13:00:00.000Z", "attempt_number": 1,
         }
         document.update(changes)
-        path = self.target / f"dubvi-reup-job-{self.job_id}.job.json"
+        path = self.target / f"dubvi-reup-job-{document['reup_job_id']}.job.json"
         path.write_bytes(canonical_json_bytes(document))
         return path
 
@@ -57,12 +57,46 @@ class P1CReupIntakeTests(unittest.TestCase):
         self._write_envelope()
         first = accept_next_reup_job(self.root, self.status, occurred_at_utc="2026-09-10T13:01:00.000Z")
         assert first is not None
-        second = accept_next_reup_job(self.root, self.status, occurred_at_utc="2026-09-10T13:02:00.000Z")
+        second = accept_reup_envelope(first.envelope_path, self.root, self.status, occurred_at_utc="2026-09-10T13:02:00.000Z")
         assert second is not None
         self.assertEqual(first.status_path, second.status_path)
         event = validate_engine_status_event(json.loads(first.status_path.read_text(encoding="utf-8")))
         self.assertEqual(("accepted", "accepted", 1), (event["event_kind"], event["state"], event["sequence"]))
         self.assertEqual([], list(first.status_path.parent.glob("event-000002.json")))
+
+    def test_accept_next_advances_past_valid_accepted_jobs(self) -> None:
+        first_id = "11111111-1111-4111-8111-111111111111"
+        second_id = "22222222-2222-4222-8222-222222222222"
+        first_envelope = self._write_envelope(reup_job_id=first_id)
+        second_envelope = self._write_envelope(reup_job_id=second_id)
+
+        first = accept_next_reup_job(self.root, self.status, occurred_at_utc="2026-09-10T13:01:00.000Z")
+        assert first is not None
+        self.assertEqual(first_envelope, first.envelope_path)
+        first_bytes = first.status_path.read_bytes()
+        self.assertFalse((self.status / "reup" / second_id / "event-000001.json").exists())
+
+        second = accept_next_reup_job(self.root, self.status, occurred_at_utc="2026-09-10T13:02:00.000Z")
+        assert second is not None
+        self.assertEqual(second_envelope, second.envelope_path)
+        self.assertEqual(first_bytes, first.status_path.read_bytes())
+        self.assertIsNone(accept_next_reup_job(self.root, self.status, occurred_at_utc="2026-09-10T13:03:00.000Z"))
+        self.assertEqual(first_bytes, first.status_path.read_bytes())
+        self.assertEqual([], list(self.status.rglob("event-000002.json")))
+
+    def test_corrupt_first_accepted_status_blocks_queue_before_later_job(self) -> None:
+        first_id = "11111111-1111-4111-8111-111111111111"
+        second_id = "22222222-2222-4222-8222-222222222222"
+        self._write_envelope(reup_job_id=first_id)
+        self._write_envelope(reup_job_id=second_id)
+        corrupt = self.status / "reup" / first_id / "event-000001.json"
+        corrupt.parent.mkdir(parents=True)
+        corrupt.write_text("{}", encoding="utf-8")
+
+        with self.assertRaises(ReupIntakeError):
+            accept_next_reup_job(self.root, self.status)
+        self.assertEqual("{}", corrupt.read_text(encoding="utf-8"))
+        self.assertFalse((self.status / "reup" / second_id / "event-000001.json").exists())
 
     def test_rejects_media_fingerprint_mismatch_and_legacy_namespace_is_fenced(self) -> None:
         self._write_envelope()

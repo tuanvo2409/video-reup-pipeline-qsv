@@ -16,6 +16,7 @@ from pipeline.cache_manager import (
     clear_cache_history,
     get_cache_stats,
 )
+from pipeline.input_rules import is_legacy_media_input
 
 # Setup root logging
 logging.basicConfig(
@@ -34,11 +35,11 @@ def scan_input_files() -> List[Path]:
         return []
     found: List[Path] = []
     for item in config.input_dir.iterdir():
-        if item.is_file() and item.suffix.lower() in config.supported_extensions:
+        if is_legacy_media_input(item, config.supported_extensions):
             found.append(item)
         elif item.is_dir() and not item.name.startswith("."):
             for sub_item in item.rglob("*"):
-                if sub_item.is_file() and sub_item.suffix.lower() in config.supported_extensions:
+                if is_legacy_media_input(sub_item, config.supported_extensions):
                     found.append(sub_item)
     return found
 

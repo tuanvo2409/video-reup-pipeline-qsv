@@ -35,6 +35,13 @@ class PipelineConfig:
     # DUBVI Bridge Directory (Giai đoạn 2). This intentionally shares the
     # translator's existing DUBVI_MEDIA_DIR setting.
     dubvi_media_dir: Path = field(default_factory=lambda: _path_from_env("DUBVI_MEDIA_DIR", BASE_DIR / "dubvi-media"))
+    # P1C status evidence is optional and is created only by an explicit
+    # canonical-intake operation, never while configuration is imported.
+    engine_status_dir: Path | None = field(
+        default_factory=lambda: (
+            Path(value).expanduser() if (value := os.getenv("DUBVI_ENGINE_STATUS_DIR")) else None
+        )
+    )
     auto_send_to_dubvi: bool = False
 
     # Video output resolution (9:16 vertical standard)

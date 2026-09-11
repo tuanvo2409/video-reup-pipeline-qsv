@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import sys
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -12,7 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from pipeline.p1c_lease_client import LeaseBridgeResponse, LeaseBridgeUnavailable
-from pipeline.p1c_status import publish_accepted_status
+from pipeline.p1c_status import ReupStatusError, publish_accepted_status
 from pipeline.p1c_worker import run_lease_aware_work
 
 
@@ -46,6 +47,39 @@ class WorkerTests(unittest.TestCase):
         result = run_lease_aware_work(self.job, self.root, Client(), lambda job: called.append(job))
         self.assertEqual("capacity_unavailable", result.outcome); self.assertEqual([], called)
         self.assertFalse((self.root / "reup" / JOB_ID / "event-000002.json").exists())
+
+    def test_missing_accepted_evidence_never_acquires(self):
+        class Client:
+            def acquire(_ , job): raise AssertionError("acquire must not run")
+        result = run_lease_aware_work(self.job, self.root / "missing", Client(), lambda job: (_ for _ in ()).throw(AssertionError()))
+        self.assertEqual("accepted_status_unavailable", result.outcome)
+
+    def test_started_publication_failure_releases_exact_acquired_lease(self):
+        released = []
+        class Client:
+            def acquire(_, job): return response("acquire", granted=True)
+            def release(_, job, lease_id): released.append(lease_id); return response("release")
+        with patch("pipeline.p1c_worker.publish_started_status", side_effect=ReupStatusError("conflict")):
+            result = run_lease_aware_work(self.job, self.root, Client(), lambda job: (_ for _ in ()).throw(AssertionError()))
+        self.assertEqual("started_status_unavailable", result.outcome); self.assertEqual([LEASE_ID], released)
+
+    def test_start_work_exception_releases_and_never_heartbeats(self):
+        released = []
+        class Client:
+            def acquire(_, job): return response("acquire", granted=True)
+            def release(_, job, lease_id): released.append(lease_id); return response("release")
+            def heartbeat(_, job, lease_id): raise AssertionError("heartbeat must not run")
+        def start(_): raise RuntimeError("start failed")
+        result = run_lease_aware_work(self.job, self.root, Client(), start)
+        self.assertEqual("work_start_failed", result.outcome); self.assertEqual([LEASE_ID], released)
+
+    def test_cleanup_failure_is_explicit(self):
+        class Client:
+            def acquire(_, job): return response("acquire", granted=True)
+            def release(_, job, lease_id): raise LeaseBridgeUnavailable("release down")
+        with patch("pipeline.p1c_worker.publish_started_status", side_effect=ReupStatusError("conflict")):
+            result = run_lease_aware_work(self.job, self.root, Client(), lambda job: None)
+        self.assertEqual("started_status_unavailable_release_unconfirmed", result.outcome)
 
     def test_started_then_completion_releases_owned_lease(self):
         class Client:

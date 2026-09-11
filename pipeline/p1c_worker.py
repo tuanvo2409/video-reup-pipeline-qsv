@@ -8,7 +8,12 @@ from dataclasses import dataclass
 from typing import Callable, Mapping, Protocol
 
 from pipeline.p1c_lease_client import LeaseBridgeResponse, LeaseBridgeUnavailable
-from pipeline.p1c_status import ReupStatusError, publish_lease_lost_status, publish_started_status
+from pipeline.p1c_status import (
+    ReupStatusError,
+    inspect_existing_accepted_status,
+    publish_lease_lost_status,
+    publish_started_status,
+)
 
 
 class HeavyWorkHandle(Protocol):
@@ -26,6 +31,12 @@ class WorkerResult:
 def run_lease_aware_work(job: Mapping[str, object], status_root, lease_client, start_work: Callable[[Mapping[str, object]], HeavyWorkHandle], *, monotonic: Callable[[], float] = time.monotonic, sleep: Callable[[float], None] = time.sleep, occurred_at_utc: str | None = None, utc_now: Callable[[], str] | None = None) -> WorkerResult:
     """Admit one accepted job, start only after a valid lease, then renew it."""
     try:
+        accepted = inspect_existing_accepted_status(status_root, job)
+    except ReupStatusError:
+        return WorkerResult("accepted_status_unavailable")
+    if accepted is None:
+        return WorkerResult("accepted_status_unavailable")
+    try:
         admission: LeaseBridgeResponse = lease_client.acquire(job)
     except LeaseBridgeUnavailable:
         return WorkerResult("lease_unavailable")
@@ -34,9 +45,12 @@ def run_lease_aware_work(job: Mapping[str, object], status_root, lease_client, s
     lease_id = str(admission.lease["lease_id"])
     try:
         publish_started_status(status_root, job, lease_id, occurred_at_utc=occurred_at_utc)
-    except ReupStatusError:
-        return WorkerResult("started_status_unavailable", lease_id)
-    handle = start_work(job)
+    except Exception:
+        return _cleanup_before_work(lease_client, job, lease_id, "started_status_unavailable")
+    try:
+        handle = start_work(job)
+    except Exception:
+        return _cleanup_before_work(lease_client, job, lease_id, "work_start_failed")
     now = utc_now or _utc_now
     confirmed_expiry = str(admission.lease["expires_at"])
     next_heartbeat = monotonic() + admission.heartbeat_seconds
@@ -68,6 +82,14 @@ def run_lease_aware_work(job: Mapping[str, object], status_root, lease_client, s
     except LeaseBridgeUnavailable:
         return WorkerResult("work_completed_release_unconfirmed", lease_id)
     return WorkerResult("work_completed_lease_released" if released.lease is not None else "work_completed_release_unconfirmed", lease_id)
+
+
+def _cleanup_before_work(lease_client, job: Mapping[str, object], lease_id: str, outcome: str) -> WorkerResult:
+    try:
+        lease_client.release(job, lease_id)
+    except LeaseBridgeUnavailable:
+        return WorkerResult(outcome + "_release_unconfirmed", lease_id)
+    return WorkerResult(outcome, lease_id)
 
 
 def _utc_now() -> str:

@@ -7,6 +7,8 @@ import os
 import subprocess
 import sys
 import uuid
+import re
+from datetime import datetime, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -14,6 +16,7 @@ from typing import Mapping
 
 BRIDGE_TIMEOUT_SECONDS = 10
 _MAX_STDOUT = 64 * 1024
+_CANONICAL_TIMESTAMP = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z$")
 
 
 class LeaseBridgeUnavailable(RuntimeError):
@@ -73,16 +76,16 @@ class LeaseBridgeClient:
             value = json.loads(result.stdout)
         except (TypeError, ValueError) as error:
             raise LeaseBridgeUnavailable("lease bridge returned malformed JSON") from error
-        return _validate_response(value, action, job_id)
+        return _validate_response(value, action, job_id, lease_id)
 
 
-def _validate_response(value: object, action: str, job_id: str) -> LeaseBridgeResponse:
+def _validate_response(value: object, action: str, job_id: str, expected_lease_id: str | None = None) -> LeaseBridgeResponse:
     if not isinstance(value, dict) or set(value) - {"bridge_version", "action", "ok", "engine_kind", "timing", "lease", "granted"}:
         raise LeaseBridgeUnavailable("lease bridge response shape is unsafe")
     if value.get("bridge_version") != 1 or value.get("action") != action or value.get("ok") is not True or value.get("engine_kind") != "reup":
         raise LeaseBridgeUnavailable("lease bridge response identity is unsafe")
     timing = value.get("timing")
-    if not isinstance(timing, dict):
+    if not isinstance(timing, dict) or set(timing) != {"heartbeat_seconds", "ttl_seconds"}:
         raise LeaseBridgeUnavailable("lease bridge timing is invalid")
     heartbeat, ttl = timing.get("heartbeat_seconds"), timing.get("ttl_seconds")
     if isinstance(heartbeat, bool) or isinstance(ttl, bool) or not isinstance(heartbeat, int) or not isinstance(ttl, int) or heartbeat <= 0 or ttl < 4 * heartbeat:
@@ -91,14 +94,25 @@ def _validate_response(value: object, action: str, job_id: str) -> LeaseBridgeRe
     if action == "acquire" and not isinstance(value.get("granted"), bool):
         raise LeaseBridgeUnavailable("lease bridge acquire response is invalid")
     if lease is not None:
-        if not isinstance(lease, dict) or lease.get("resource_class") != "HEAVY_MEDIA" or lease.get("owner") != f"reup:{job_id}" or lease.get("job_id") != job_id:
+        if not isinstance(lease, dict) or set(lease) != {"lease_id", "resource_class", "owner", "job_id", "state", "acquired_at", "heartbeat_at", "expires_at", "released_at"} or lease.get("resource_class") != "HEAVY_MEDIA" or lease.get("owner") != f"reup:{job_id}" or lease.get("job_id") != job_id:
             raise LeaseBridgeUnavailable("lease bridge lease identity is invalid")
         _uuid(lease.get("lease_id"), "lease_id")
+        if expected_lease_id is not None and lease["lease_id"] != expected_lease_id:
+            raise LeaseBridgeUnavailable("lease bridge returned an unrelated lease")
         if lease.get("state") not in ({"active"} if action != "release" else {"released"}):
             raise LeaseBridgeUnavailable("lease bridge lease state is invalid")
-        for key in ("acquired_at", "heartbeat_at", "expires_at"):
-            if not isinstance(lease.get(key), str) or not lease[key].endswith("Z"):
-                raise LeaseBridgeUnavailable("lease bridge timestamp is invalid")
+        acquired = _timestamp(lease.get("acquired_at"), "acquired_at")
+        heartbeat_at = _timestamp(lease.get("heartbeat_at"), "heartbeat_at")
+        expires = _timestamp(lease.get("expires_at"), "expires_at")
+        if not acquired <= heartbeat_at < expires:
+            raise LeaseBridgeUnavailable("lease bridge lease timestamps are not ordered")
+        if lease["state"] == "active":
+            if lease.get("released_at") is not None:
+                raise LeaseBridgeUnavailable("active bridge lease must not have released_at")
+        else:
+            released = _timestamp(lease.get("released_at"), "released_at")
+            if released < heartbeat_at:
+                raise LeaseBridgeUnavailable("released_at precedes lease heartbeat")
     if action == "acquire" and value["granted"] != (lease is not None):
         raise LeaseBridgeUnavailable("lease bridge acquire decision is invalid")
     return LeaseBridgeResponse(action, value.get("granted"), heartbeat, ttl, lease)
@@ -113,3 +127,15 @@ def _uuid(value: object, field: str) -> str:
     except (ValueError, TypeError, AttributeError) as error:
         raise LeaseBridgeUnavailable(f"{field} is invalid") from error
     return value
+
+
+def _timestamp(value: object, field: str) -> datetime:
+    if not isinstance(value, str) or _CANONICAL_TIMESTAMP.fullmatch(value) is None:
+        raise LeaseBridgeUnavailable(f"{field} is not canonical UTC milliseconds")
+    try:
+        parsed = datetime.fromisoformat(value[:-1] + "+00:00")
+    except ValueError as error:
+        raise LeaseBridgeUnavailable(f"{field} is not a real calendar timestamp") from error
+    if parsed.tzinfo is None or parsed.utcoffset() != timezone.utc.utcoffset(None):
+        raise LeaseBridgeUnavailable(f"{field} is not UTC")
+    return parsed

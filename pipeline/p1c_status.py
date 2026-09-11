@@ -74,7 +74,23 @@ def publish_lease_lost_status(status_root: Path, job: Mapping[str, object], leas
     return _publish_status(status_root, job, sequence=3, event_kind="lease_lost", state="running", lease_id=lease_id, occurred_at_utc=occurred_at_utc)
 
 
-def _publish_status(status_root: Path, job: Mapping[str, object], *, sequence: int, event_kind: str, state: str, lease_id: str | None = None, occurred_at_utc: str | None = None) -> Path:
+def publish_output_published_status(status_root: Path, job: Mapping[str, object], output_fingerprint: str, *, occurred_at_utc: str | None = None) -> Path:
+    return _publish_status(status_root, job, sequence=3, event_kind="output_published", state="running", output_fingerprint=output_fingerprint, occurred_at_utc=occurred_at_utc)
+
+
+def publish_failed_status(status_root: Path, job: Mapping[str, object], error_classification: str, diagnostic_summary: str, *, occurred_at_utc: str | None = None) -> Path:
+    return _publish_status(status_root, job, sequence=3, event_kind="failed", state="failed", error_classification=error_classification, diagnostic_summary=diagnostic_summary[:2048], occurred_at_utc=occurred_at_utc)
+
+
+def publish_handoff_published_status(status_root: Path, job: Mapping[str, object], output_fingerprint: str, handoff_id: str, handoff_ref: str, *, occurred_at_utc: str | None = None) -> Path:
+    return _publish_status(status_root, job, sequence=4, event_kind="handoff_published", state="running", output_fingerprint=output_fingerprint, handoff_id=handoff_id, handoff_ref=handoff_ref, occurred_at_utc=occurred_at_utc)
+
+
+def publish_succeeded_status(status_root: Path, job: Mapping[str, object], output_fingerprint: str, handoff_id: str, handoff_ref: str, *, occurred_at_utc: str | None = None) -> Path:
+    return _publish_status(status_root, job, sequence=5, event_kind="succeeded", state="succeeded", output_fingerprint=output_fingerprint, handoff_id=handoff_id, handoff_ref=handoff_ref, occurred_at_utc=occurred_at_utc)
+
+
+def _publish_status(status_root: Path, job: Mapping[str, object], *, sequence: int, event_kind: str, state: str, lease_id: str | None = None, output_fingerprint: str | None = None, handoff_id: str | None = None, handoff_ref: str | None = None, error_classification: str | None = None, diagnostic_summary: str | None = None, occurred_at_utc: str | None = None) -> Path:
     attempt_number, parent_job_id = _runtime_lineage(job)
     job_id = str(job.get("reup_job_id", ""))
     dispatch_id = str(job.get("dispatch_id", ""))
@@ -98,6 +114,9 @@ def _publish_status(status_root: Path, job: Mapping[str, object], *, sequence: i
         event["parent_engine_job_id"] = parent_job_id
     if lease_id is not None:
         event["lease_id"] = lease_id
+    for field, value in (("output_fingerprint", output_fingerprint), ("handoff_id", handoff_id), ("handoff_ref", handoff_ref), ("error_classification", error_classification), ("diagnostic_summary", diagnostic_summary)):
+        if value is not None:
+            event[field] = value
     document = validate_engine_status_event(event)
     payload = canonical_json_bytes(document)
     root = _require_status_root(status_root)
@@ -112,10 +131,20 @@ def _publish_status(status_root: Path, job: Mapping[str, object], *, sequence: i
         if not previous.exists() and not previous.is_symlink():
             raise ReupStatusError("lease_lost status requires valid started status")
         _validate_existing(previous, job, sequence=2, event_kind="started", state="running", lease_id=lease_id)
+    elif sequence == 4:
+        previous = directory / "event-000003.json"
+        if not previous.exists() and not previous.is_symlink():
+            raise ReupStatusError("handoff_published requires sequence-3 output evidence")
+        _validate_existing(previous, job, sequence=3, event_kind="output_published", state="running", output_fingerprint=output_fingerprint)
+    elif sequence == 5:
+        previous = directory / "event-000004.json"
+        if not previous.exists() and not previous.is_symlink():
+            raise ReupStatusError("succeeded requires sequence-4 handoff evidence")
+        _validate_existing(previous, job, sequence=4, event_kind="handoff_published", state="running", output_fingerprint=output_fingerprint, handoff_id=handoff_id, handoff_ref=handoff_ref)
     final = directory / f"event-{sequence:06d}.json"
     _assert_under(root, final)
     if final.exists() or final.is_symlink():
-        _validate_existing(final, job, sequence=sequence, event_kind=event_kind, state=state, lease_id=lease_id)
+        _validate_existing(final, job, sequence=sequence, event_kind=event_kind, state=state, lease_id=lease_id, output_fingerprint=output_fingerprint, handoff_id=handoff_id, handoff_ref=handoff_ref)
         return final
     directory.mkdir(parents=True, exist_ok=True)
     stage = directory / f".event-{sequence:06d}.{document['event_id']}.part"
@@ -136,7 +165,7 @@ def _publish_status(status_root: Path, job: Mapping[str, object], *, sequence: i
     return final
 
 
-def _validate_existing(path: Path, job: Mapping[str, object], *, sequence: int = 1, event_kind: str = "accepted", state: str = "accepted", lease_id: str | None = None) -> None:
+def _validate_existing(path: Path, job: Mapping[str, object], *, sequence: int = 1, event_kind: str = "accepted", state: str = "accepted", lease_id: str | None = None, output_fingerprint: str | None = None, handoff_id: str | None = None, handoff_ref: str | None = None) -> None:
     if path.is_symlink() or not path.is_file():
         raise ReupStatusError("existing accepted status is not a regular file")
     size = path.stat().st_size
@@ -163,8 +192,11 @@ def _validate_existing(path: Path, job: Mapping[str, object], *, sequence: int =
         raise ReupStatusError("existing accepted status conflicts with canonical job identity")
     if document.get("parent_engine_job_id") != job.get("parent_reup_job_id"):
         raise ReupStatusError("existing accepted status conflicts with retry lineage")
-    if document.get("lease_id") != lease_id:
+    if lease_id is not None and document.get("lease_id") != lease_id:
         raise ReupStatusError("existing status conflicts with lease identity")
+    for field, value in (("output_fingerprint", output_fingerprint), ("handoff_id", handoff_id), ("handoff_ref", handoff_ref)):
+        if value is not None and document.get(field) != value:
+            raise ReupStatusError(f"existing status conflicts with {field}")
     if payload != canonical_json_bytes(document):
         raise ReupStatusError("existing accepted status is not canonical bytes")
 

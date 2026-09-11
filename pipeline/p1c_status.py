@@ -63,6 +63,18 @@ def publish_accepted_status(
     beyond the one immutable acceptance event.
     """
 
+    return _publish_status(status_root, job, sequence=1, event_kind="accepted", state="accepted", occurred_at_utc=occurred_at_utc)
+
+
+def publish_started_status(status_root: Path, job: Mapping[str, object], lease_id: str, *, occurred_at_utc: str | None = None) -> Path:
+    return _publish_status(status_root, job, sequence=2, event_kind="started", state="running", lease_id=lease_id, occurred_at_utc=occurred_at_utc)
+
+
+def publish_lease_lost_status(status_root: Path, job: Mapping[str, object], lease_id: str, *, occurred_at_utc: str | None = None) -> Path:
+    return _publish_status(status_root, job, sequence=3, event_kind="lease_lost", state="running", lease_id=lease_id, occurred_at_utc=occurred_at_utc)
+
+
+def _publish_status(status_root: Path, job: Mapping[str, object], *, sequence: int, event_kind: str, state: str, lease_id: str | None = None, occurred_at_utc: str | None = None) -> Path:
     attempt_number, parent_job_id = _runtime_lineage(job)
     job_id = str(job.get("reup_job_id", ""))
     dispatch_id = str(job.get("dispatch_id", ""))
@@ -76,25 +88,37 @@ def publish_accepted_status(
         "engine_job_id": job_id,
         "dispatch_id": dispatch_id,
         "correlation_id": dispatch_id,
-        "sequence": 1,
+        "sequence": sequence,
         "attempt_number": attempt_number,
-        "event_kind": "accepted",
-        "state": "accepted",
+        "event_kind": event_kind,
+        "state": state,
         "occurred_at_utc": occurred_at_utc or _now_utc_millis(),
     }
     if parent_job_id is not None:
         event["parent_engine_job_id"] = parent_job_id
+    if lease_id is not None:
+        event["lease_id"] = lease_id
     document = validate_engine_status_event(event)
     payload = canonical_json_bytes(document)
     root = _require_status_root(status_root)
     directory = _require_status_subdirectory(root, "reup", job_id)
-    final = directory / "event-000001.json"
+    if sequence == 2:
+        previous = directory / "event-000001.json"
+        if not previous.exists() and not previous.is_symlink():
+            raise ReupStatusError("started status requires valid accepted status")
+        _validate_existing(previous, job)
+    elif sequence == 3:
+        previous = directory / "event-000002.json"
+        if not previous.exists() and not previous.is_symlink():
+            raise ReupStatusError("lease_lost status requires valid started status")
+        _validate_existing(previous, job, sequence=2, event_kind="started", state="running", lease_id=lease_id)
+    final = directory / f"event-{sequence:06d}.json"
     _assert_under(root, final)
     if final.exists() or final.is_symlink():
-        _validate_existing(final, job)
+        _validate_existing(final, job, sequence=sequence, event_kind=event_kind, state=state, lease_id=lease_id)
         return final
     directory.mkdir(parents=True, exist_ok=True)
-    stage = directory / f".event-000001.{document['event_id']}.part"
+    stage = directory / f".event-{sequence:06d}.{document['event_id']}.part"
     _stage_exact(stage, payload)
     try:
         os.link(stage, final)
@@ -112,7 +136,7 @@ def publish_accepted_status(
     return final
 
 
-def _validate_existing(path: Path, job: Mapping[str, object]) -> None:
+def _validate_existing(path: Path, job: Mapping[str, object], *, sequence: int = 1, event_kind: str = "accepted", state: str = "accepted", lease_id: str | None = None) -> None:
     if path.is_symlink() or not path.is_file():
         raise ReupStatusError("existing accepted status is not a regular file")
     size = path.stat().st_size
@@ -131,14 +155,16 @@ def _validate_existing(path: Path, job: Mapping[str, object]) -> None:
         "dispatch_id": job["dispatch_id"],
         "correlation_id": job["dispatch_id"],
         "attempt_number": job["attempt_number"],
-        "event_kind": "accepted",
-        "state": "accepted",
-        "sequence": 1,
+        "event_kind": event_kind,
+        "state": state,
+        "sequence": sequence,
     }
     if any(document.get(field) != value for field, value in expected.items()):
         raise ReupStatusError("existing accepted status conflicts with canonical job identity")
     if document.get("parent_engine_job_id") != job.get("parent_reup_job_id"):
         raise ReupStatusError("existing accepted status conflicts with retry lineage")
+    if document.get("lease_id") != lease_id:
+        raise ReupStatusError("existing status conflicts with lease identity")
     if payload != canonical_json_bytes(document):
         raise ReupStatusError("existing accepted status is not canonical bytes")
 

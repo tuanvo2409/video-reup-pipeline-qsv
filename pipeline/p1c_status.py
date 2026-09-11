@@ -51,6 +51,67 @@ def inspect_existing_accepted_status(status_root: Path, job: Mapping[str, object
     return final
 
 
+def load_status_event(
+    status_root: Path,
+    job: Mapping[str, object],
+    sequence: int,
+) -> dict[str, object]:
+    """Load one exact immutable Reup status event without side effects."""
+
+    attempt_number, parent_job_id = _runtime_lineage(job)
+    job_id = str(job.get("reup_job_id", ""))
+    dispatch_id = str(job.get("dispatch_id", ""))
+    if not job_id or not dispatch_id:
+        raise ReupStatusError("status event requires a validated job identity")
+    if isinstance(sequence, bool) or not isinstance(sequence, int) or sequence < 1:
+        raise ReupStatusError("status sequence must be positive")
+    if not status_root.exists() or status_root.is_symlink() or not status_root.is_dir():
+        raise ReupStatusError("status_root must be an existing real directory")
+    root = status_root.resolve()
+    path = root / "reup" / job_id / f"event-{sequence:06d}.json"
+    _assert_under(root, path)
+    if path.is_symlink() or not path.is_file():
+        raise ReupStatusError("requested Reup status event is absent or unsafe")
+    size = path.stat().st_size
+    if size <= 0 or size > MAX_REUP_STATUS_EVENT_BYTES:
+        raise ReupStatusError("Reup status event has an unsafe size")
+    payload = path.read_bytes()
+    if len(payload) != size:
+        raise ReupStatusError("Reup status event changed while read")
+    try:
+        document = validate_engine_status_event(parse_json_document(payload))
+    except Exception as error:
+        raise ReupStatusError("Reup status event is invalid") from error
+    expected = {
+        "engine_kind": "reup",
+        "engine_job_id": job_id,
+        "dispatch_id": dispatch_id,
+        "correlation_id": dispatch_id,
+        "attempt_number": attempt_number,
+        "sequence": sequence,
+    }
+    if any(document.get(field) != value for field, value in expected.items()):
+        raise ReupStatusError("Reup status event conflicts with canonical job identity")
+    if document.get("parent_engine_job_id") != parent_job_id:
+        raise ReupStatusError("Reup status event conflicts with retry lineage")
+    if payload != canonical_json_bytes(document):
+        raise ReupStatusError("Reup status event is not canonical bytes")
+    expected_pairs = {
+        1: {("accepted", "accepted")},
+        2: {("started", "running")},
+        3: {
+            ("output_published", "running"),
+            ("failed", "failed"),
+            ("lease_lost", "running"),
+        },
+        4: {("handoff_published", "running")},
+        5: {("succeeded", "succeeded")},
+    }
+    if sequence not in expected_pairs or (document["event_kind"], document["state"]) not in expected_pairs[sequence]:
+        raise ReupStatusError("Reup status sequence has an illegal event kind")
+    return document
+
+
 def publish_accepted_status(
     status_root: Path,
     job: Mapping[str, object],

@@ -15,6 +15,7 @@ from pipeline import p1c_processing
 from pipeline.config import config
 from pipeline.dubvi_engine_contract import canonical_json_bytes
 from pipeline.p1c_intake import AcceptedReupJob
+from pipeline.p1c_output import publish_reup_output
 from pipeline.p1c_status import publish_accepted_status, publish_started_status
 
 
@@ -64,6 +65,32 @@ class P1CProcessingTests(unittest.TestCase):
         self.media_root = self.root / "media"
         self.processing_root = self.root / "processing"
 
+    def _prepare_output(self, payload: bytes = b"processed"):
+        candidate = self.output_root / "legacy-output.mp4"
+        candidate.write_bytes(payload)
+        return publish_reup_output(candidate, self.job, self.output_root)
+
+    def _complete_successful_attempt(self):
+        calls = 0
+
+        def processor(path: Path, **kwargs: object) -> object:
+            nonlocal calls
+            calls += 1
+            candidate = self.output_root / "legacy-output.mp4"
+            candidate.write_bytes(b"processed")
+            return SimpleNamespace(success=True, output_file=str(candidate))
+
+        with mock.patch.object(config, "processing_dir", self.processing_root):
+            result = p1c_processing.process_reup_attempt(
+                self.accepted, self.status_root, processor=processor,
+                output_root=self.output_root, media_root=self.media_root,
+            )
+        self.assertEqual("succeeded", result.outcome)
+        event_dir = self.status_root / "reup" / self.job["reup_job_id"]
+        output_path = self.output_root / "p1c" / self.job["reup_job_id"] / "output.mp4"
+        handoff_dir = self.media_root / self.job["reup_profile"]
+        return calls, event_dir, output_path, handoff_dir
+
     def test_processing_uses_attempt_copy_exact_legacy_call_and_publishes_1_to_5(self) -> None:
         calls: list[tuple[Path, dict[str, object]]] = []
 
@@ -109,6 +136,99 @@ class P1CProcessingTests(unittest.TestCase):
         processor.assert_not_called()
         event = json.loads((self.status_root / "reup" / self.job["reup_job_id"] / "event-000003.json").read_text(encoding="utf-8"))
         self.assertEqual("PROCESSING_FAILED", event["error_classification"])
+
+    def test_missing_event3_recovers_exact_stage_and_final_without_rerendering(self) -> None:
+        prepared = self._prepare_output()
+        processor = mock.Mock()
+        result = p1c_processing.recover_reup_completion(
+            self.job, self.status_root, output_root=self.output_root, media_root=self.media_root,
+        )
+        self.assertEqual("succeeded", result)
+        processor.assert_not_called()
+        event_dir = self.status_root / "reup" / self.job["reup_job_id"]
+        events = [json.loads((event_dir / f"event-{number:06d}.json").read_text(encoding="utf-8")) for number in (3, 4, 5)]
+        self.assertEqual(["output_published", "handoff_published", "succeeded"], [event["event_kind"] for event in events])
+        self.assertEqual(prepared.fingerprint, events[0]["output_fingerprint"])
+        self.assertEqual([], list(prepared.final_path.parent.glob(".output.*.part")))
+
+    def test_missing_event3_recovers_stage_only_by_linking_final(self) -> None:
+        prepared = self._prepare_output()
+        prepared.final_path.unlink()
+        result = p1c_processing.recover_reup_completion(
+            self.job, self.status_root, output_root=self.output_root, media_root=self.media_root,
+        )
+        self.assertEqual("succeeded", result)
+        self.assertEqual(b"processed", prepared.final_path.read_bytes())
+        self.assertTrue((self.status_root / "reup" / self.job["reup_job_id"] / "event-000003.json").is_file())
+
+    def test_final_without_stage_or_event3_does_not_infer_output_published(self) -> None:
+        prepared = self._prepare_output()
+        prepared.stage_path.unlink()
+        result = p1c_processing.recover_reup_completion(
+            self.job, self.status_root, output_root=self.output_root, media_root=self.media_root,
+        )
+        self.assertEqual("reconciliation_required", result)
+        self.assertFalse((self.status_root / "reup" / self.job["reup_job_id"] / "event-000003.json").exists())
+
+    def test_missing_event3_rejects_bad_stage_multiple_stages_and_differing_final(self) -> None:
+        final_dir = self.output_root / "p1c" / self.job["reup_job_id"]
+        final_dir.mkdir(parents=True)
+        bad_name = final_dir / (".output." + "0" * 64 + ".part")
+        bad_name.write_bytes(b"bad")
+        self.assertEqual("reconciliation_required", p1c_processing.recover_reup_completion(self.job, self.status_root, output_root=self.output_root, media_root=self.media_root))
+        first = b"one"
+        second = b"two"
+        (final_dir / f".output.{hashlib.sha256(first).hexdigest()}.part").write_bytes(first)
+        (final_dir / f".output.{hashlib.sha256(second).hexdigest()}.part").write_bytes(second)
+        self.assertEqual("reconciliation_required", p1c_processing.recover_reup_completion(self.job, self.status_root, output_root=self.output_root, media_root=self.media_root))
+        for path in final_dir.glob(".output.*.part"):
+            path.unlink()
+        prepared = self._prepare_output()
+        prepared.final_path.unlink()
+        prepared.final_path.write_bytes(b"different-final")
+        self.assertEqual("reconciliation_required", p1c_processing.recover_reup_completion(self.job, self.status_root, output_root=self.output_root, media_root=self.media_root))
+        self.assertEqual(b"different-final", prepared.final_path.read_bytes())
+
+    def test_event5_recovery_requires_exact_output_handoff_and_chain(self) -> None:
+        calls, event_dir, output_path, handoff_dir = self._complete_successful_attempt()
+        self.assertEqual("succeeded", p1c_processing.recover_reup_completion(self.job, self.status_root, output_root=self.output_root, media_root=self.media_root))
+        self.assertEqual(1, calls)
+        output_path.unlink()
+        self.assertEqual("reconciliation_required", p1c_processing.recover_reup_completion(self.job, self.status_root, output_root=self.output_root, media_root=self.media_root))
+
+    def test_event5_recovery_rejects_hash_and_missing_video(self) -> None:
+        _, _, output_path, handoff_dir = self._complete_successful_attempt()
+        output_path.write_bytes(b"different-output")
+        self.assertEqual("reconciliation_required", p1c_processing.recover_reup_completion(self.job, self.status_root, output_root=self.output_root, media_root=self.media_root))
+
+        output_path.write_bytes(b"processed")
+        video = handoff_dir / f"reup-{self.job['reup_job_id']}.mp4"
+        video.unlink()
+        self.assertEqual("reconciliation_required", p1c_processing.recover_reup_completion(self.job, self.status_root, output_root=self.output_root, media_root=self.media_root))
+
+    def test_event5_recovery_rejects_missing_sidecar(self) -> None:
+        _, _, _, handoff_dir = self._complete_successful_attempt()
+        sidecar = handoff_dir / f"reup-{self.job['reup_job_id']}.meta.json"
+        sidecar.unlink()
+        self.assertEqual("reconciliation_required", p1c_processing.recover_reup_completion(self.job, self.status_root, output_root=self.output_root, media_root=self.media_root))
+
+    def test_event5_recovery_rejects_sidecar_handoff_id_mismatch(self) -> None:
+        _, _, _, handoff_dir = self._complete_successful_attempt()
+        sidecar = handoff_dir / f"reup-{self.job['reup_job_id']}.meta.json"
+        document = json.loads(sidecar.read_text(encoding="utf-8"))
+        document["handoff_id"] = str(uuid.uuid4())
+        sidecar.write_bytes(canonical_json_bytes(document))
+        self.assertEqual("reconciliation_required", p1c_processing.recover_reup_completion(self.job, self.status_root, output_root=self.output_root, media_root=self.media_root))
+
+    def test_event5_recovery_rejects_missing_event4(self) -> None:
+        _, event_dir, _, _ = self._complete_successful_attempt()
+        (event_dir / "event-000004.json").unlink()
+        self.assertEqual("reconciliation_required", p1c_processing.recover_reup_completion(self.job, self.status_root, output_root=self.output_root, media_root=self.media_root))
+
+    def test_event4_recovery_rejects_missing_event3(self) -> None:
+        _, event_dir, _, _ = self._complete_successful_attempt()
+        (event_dir / "event-000003.json").unlink()
+        self.assertEqual("reconciliation_required", p1c_processing.recover_reup_completion(self.job, self.status_root, output_root=self.output_root, media_root=self.media_root))
 
     def test_handoff_failure_is_recovered_without_rerendering(self) -> None:
         self.media_root.write_text("not-a-directory", encoding="utf-8")

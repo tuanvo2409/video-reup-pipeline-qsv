@@ -35,10 +35,10 @@ def publish_reup_handoff(output_path: Path, job: Mapping[str, object], media_roo
     video = directory / f"reup-{job_id}.mp4"; sidecar = directory / f"reup-{job_id}.meta.json"
     _under(root, video); _under(root, sidecar)
     if sidecar.exists() or sidecar.is_symlink():
-        document = _read_sidecar(sidecar)
-        if _existing_matches(document, job, profile, job_id, output_fingerprint, video):
-            return PublishedHandoffV2(str(document["handoff_id"]), video, sidecar, f"{profile}/{sidecar.name}", output_fingerprint)
-        raise HandoffV2Error("FINAL_PATH_CONFLICT")
+        return verify_reup_handoff(
+            output_path, job, media_root,
+            output_fingerprint=output_fingerprint,
+        )
     if video.exists() or video.is_symlink():
         if video.is_symlink() or not video.is_file() or _hash(video)[0] != output_fingerprint:
             raise HandoffV2Error("FINAL_PATH_CONFLICT")
@@ -72,30 +72,66 @@ def publish_reup_handoff(output_path: Path, job: Mapping[str, object], media_roo
 
 
 def _read_sidecar(path: Path) -> dict[str, object]:
-    if path.is_symlink() or not path.is_file() or path.stat().st_size > 64 * 1024: raise HandoffV2Error("invalid handoff sidecar")
-    try: return validate_reup_to_translator_handoff(parse_json_document(path.read_bytes()))
+    if path.is_symlink() or not path.is_file() or path.stat().st_size <= 0 or path.stat().st_size > 64 * 1024: raise HandoffV2Error("invalid handoff sidecar")
+    try:
+        raw_payload = path.read_bytes()
+        document = validate_reup_to_translator_handoff(parse_json_document(raw_payload))
+        if raw_payload != canonical_json_bytes(document):
+            raise HandoffV2Error("handoff sidecar is not canonical bytes")
+        return document
     except Exception as error: raise HandoffV2Error("invalid handoff sidecar") from error
 
 
-def _existing_matches(document: Mapping[str, object], job: Mapping[str, object], profile: str, job_id: str, output_fingerprint: str, video: Path) -> bool:
+def verify_reup_handoff(
+    output_path: Path,
+    job: Mapping[str, object],
+    media_root: Path,
+    *,
+    output_fingerprint: str,
+    expected_handoff_id: str | None = None,
+    expected_handoff_ref: str | None = None,
+) -> PublishedHandoffV2:
+    """Verify an existing complete v2 handoff without publishing anything."""
+
+    root = _existing_root(media_root)
+    profile = _safe(job.get("reup_profile"), "reup_profile")
+    job_id = _safe(job.get("reup_job_id"), "reup_job_id")
+    if root is None:
+        raise HandoffV2Error("DUBVI_MEDIA_DIR is absent")
+    if output_path.is_symlink() or not output_path.is_file() or output_path.stat().st_size <= 0 or _hash(output_path)[0] != output_fingerprint:
+        raise HandoffV2Error("canonical Reup output is not verified")
+    directory = root / profile
+    video = directory / f"reup-{job_id}.mp4"
+    sidecar = directory / f"reup-{job_id}.meta.json"
+    _under(root, directory); _under(root, video); _under(root, sidecar)
+    if directory.is_symlink() or not directory.is_dir():
+        raise HandoffV2Error("handoff profile directory is absent or unsafe")
+    if video.is_symlink() or not video.is_file() or video.stat().st_size <= 0 or _hash(video)[0] != output_fingerprint:
+        raise HandoffV2Error("handoff video is absent or differs")
+    document = _read_sidecar(sidecar)
     expected = {
+        "handoff_schema_version": 2,
+        "handoff_status": "complete",
+        "reup_job_id": job_id,
+        "dispatch_id": job.get("dispatch_id"),
+        "correlation_id": job.get("dispatch_id"),
         "candidate_id": job.get("candidate_id"),
         "schedule_id": job.get("schedule_id"),
-        "dispatch_id": job.get("dispatch_id"),
-        "reup_job_id": job_id,
-        "correlation_id": job.get("dispatch_id"),
         "channel_id": job.get("channel_id"),
         "channel_slug": job.get("channel_slug"),
         "reup_profile": profile,
         "target_platform": job.get("target_platform"),
-        "localization_profile": job.get("localization_profile"),
-        "policy_profile": job.get("policy_profile"),
         "source_fingerprint": job.get("source_fingerprint"),
         "reup_output_fingerprint": output_fingerprint,
     }
     if any(document.get(field) != value for field, value in expected.items()):
-        return False
-    return not video.is_symlink() and video.is_file() and video.stat().st_size > 0 and _hash(video)[0] == output_fingerprint
+        raise HandoffV2Error("FINAL_PATH_CONFLICT")
+    handoff_ref = f"{profile}/{sidecar.name}"
+    if expected_handoff_id is not None and document.get("handoff_id") != expected_handoff_id:
+        raise HandoffV2Error("FINAL_PATH_CONFLICT")
+    if expected_handoff_ref is not None and expected_handoff_ref != handoff_ref:
+        raise HandoffV2Error("FINAL_PATH_CONFLICT")
+    return PublishedHandoffV2(str(document["handoff_id"]), video, sidecar, handoff_ref, output_fingerprint)
 
 
 def _copy_link(source: Path, final: Path, fingerprint: str) -> None:
@@ -122,6 +158,14 @@ def _root(path: Path) -> Path:
     if path.exists() or path.is_symlink():
         if path.is_symlink() or not path.is_dir(): raise HandoffV2Error("DUBVI_MEDIA_DIR must be a real directory")
     else: path.mkdir(parents=True, exist_ok=False)
+    return path.resolve()
+
+
+def _existing_root(path: Path) -> Path | None:
+    if not path.exists() and not path.is_symlink():
+        return None
+    if path.is_symlink() or not path.is_dir():
+        raise HandoffV2Error("DUBVI_MEDIA_DIR must be a real directory")
     return path.resolve()
 
 

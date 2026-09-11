@@ -11,9 +11,16 @@ from pathlib import Path
 from typing import Callable, Mapping
 
 from pipeline.config import config
-from pipeline.p1c_handoff import HandoffV2Error, PublishedHandoffV2, publish_reup_handoff
+from pipeline.p1c_handoff import HandoffV2Error, PublishedHandoffV2, publish_reup_handoff, verify_reup_handoff
 from pipeline.p1c_intake import AcceptedReupJob, load_reup_envelope
-from pipeline.p1c_output import OutputPublicationError, PublishedReupOutput, cleanup_published_output_stage, publish_reup_output
+from pipeline.p1c_output import (
+    OutputPublicationError,
+    PublishedReupOutput,
+    cleanup_published_output_stage,
+    publish_reup_output,
+    recover_prepared_reup_output,
+    verify_reup_output,
+)
 from pipeline.p1c_status import (
     ReupStatusError, inspect_existing_accepted_status, publish_failed_status, publish_handoff_published_status,
     publish_output_published_status, publish_succeeded_status,
@@ -74,46 +81,125 @@ def process_reup_attempt(accepted: AcceptedReupJob, status_root: Path, *, proces
 
 def recover_reup_completion(job: Mapping[str, object], status_root: Path, *, output_root: Path | None = None, media_root: Path | None = None) -> str:
     """Complete only durable output/handoff evidence; never rerender."""
-    # Recovery deliberately observes status files and uses the canonical paths.
     event_dir = status_root / "reup" / str(job["reup_job_id"])
-    final_event = _load_recovery_event(event_dir / "event-000005.json", job, 5)
+    try:
+        final_event = _load_recovery_event(event_dir / "event-000005.json", job, 5)
+        handoff_event = _load_recovery_event(event_dir / "event-000004.json", job, 4)
+        output_event = _load_recovery_event(event_dir / "event-000003.json", job, 3)
+    except ReupStatusError:
+        return "reconciliation_required"
+    output_path = _canonical_output_path(job, output_root or config.output_dir)
     if final_event is not None:
+        if not _coherent_terminal_chain(output_event, handoff_event, final_event):
+            return "reconciliation_required"
+        try:
+            verify_reup_output(output_path, str(final_event["output_fingerprint"]))
+            verify_reup_handoff(
+                output_path, job, media_root or config.dubvi_media_dir,
+                output_fingerprint=str(final_event["output_fingerprint"]),
+                expected_handoff_id=str(final_event["handoff_id"]),
+                expected_handoff_ref=str(final_event["handoff_ref"]),
+            )
+        except (OutputPublicationError, HandoffV2Error):
+            return "reconciliation_required"
         _cleanup_output_stage_for(job, final_event.get("output_fingerprint"), output_root or config.output_dir)
         return "succeeded"
-    event = _load_recovery_event(event_dir / "event-000003.json", job, 3)
-    if event is not None:
-        if event.get("event_kind") == "failed": return "failed"
-        if event.get("event_kind") == "lease_lost": return "reconciliation_required"
-        if event.get("event_kind") != "output_published" or not isinstance(event.get("output_fingerprint"), str):
-            return "reconciliation_required"
-    handoff_event = _load_recovery_event(event_dir / "event-000004.json", job, 4)
     if handoff_event is not None:
+        if not _coherent_handoff_chain(output_event, handoff_event):
+            return "reconciliation_required"
         try:
-            output = Path(output_root or config.output_dir) / "p1c" / str(job["reup_job_id"]) / "output.mp4"
-            handoff = publish_reup_handoff(
-                output, job, media_root or config.dubvi_media_dir,
+            verify_reup_output(output_path, str(handoff_event["output_fingerprint"]))
+            verify_reup_handoff(
+                output_path, job, media_root or config.dubvi_media_dir,
                 output_fingerprint=str(handoff_event["output_fingerprint"]),
+                expected_handoff_id=str(handoff_event["handoff_id"]),
+                expected_handoff_ref=str(handoff_event["handoff_ref"]),
             )
-            if handoff.handoff_id != handoff_event.get("handoff_id") or handoff.handoff_ref != handoff_event.get("handoff_ref"):
-                return "handoff_pending"
             publish_succeeded_status(
                 status_root, job, str(handoff_event["output_fingerprint"]),
                 str(handoff_event["handoff_id"]), str(handoff_event["handoff_ref"]),
             )
-            _cleanup_output_stage_for(job, handoff_event.get("output_fingerprint"), output_root or config.output_dir)
-            return "succeeded"
-        except (HandoffV2Error, ReupStatusError):
+        except (OutputPublicationError, HandoffV2Error, ReupStatusError):
             return "handoff_pending"
-    if event is not None:
-        output = Path(output_root or config.output_dir) / "p1c" / str(job["reup_job_id"]) / "output.mp4"
+        _cleanup_output_stage_for(job, handoff_event.get("output_fingerprint"), output_root or config.output_dir)
+        return "succeeded"
+    if output_event is not None:
+        if output_event["event_kind"] == "failed":
+            return "failed"
+        if output_event["event_kind"] == "lease_lost":
+            return "reconciliation_required"
+        if output_event["event_kind"] != "output_published":
+            return "reconciliation_required"
         try:
-            handoff = publish_reup_handoff(output, job, media_root or config.dubvi_media_dir, output_fingerprint=event["output_fingerprint"])
-            publish_handoff_published_status(status_root, job, event["output_fingerprint"], handoff.handoff_id, handoff.handoff_ref)
-            publish_succeeded_status(status_root, job, event["output_fingerprint"], handoff.handoff_id, handoff.handoff_ref)
-            _cleanup_output_stage_for(job, event.get("output_fingerprint"), output_root or config.output_dir)
-            return "succeeded"
-        except (HandoffV2Error, ReupStatusError): return "handoff_pending"
-    return "reconciliation_required"
+            verify_reup_output(output_path, str(output_event["output_fingerprint"]))
+        except OutputPublicationError:
+            return "reconciliation_required"
+        return _complete_handoff_after_output(
+            job, status_root, output_path, str(output_event["output_fingerprint"]),
+            output_root or config.output_dir, media_root or config.dubvi_media_dir,
+        )
+    try:
+        accepted_event = _load_recovery_event(event_dir / "event-000001.json", job, 1)
+        started_event = _load_recovery_event(event_dir / "event-000002.json", job, 2)
+    except ReupStatusError:
+        return "reconciliation_required"
+    if accepted_event is None or started_event is None:
+        return "reconciliation_required"
+    try:
+        prepared = recover_prepared_reup_output(job, output_root or config.output_dir)
+    except OutputPublicationError:
+        return "reconciliation_required"
+    if prepared is None:
+        return "reconciliation_required"
+    try:
+        publish_output_published_status(status_root, job, prepared.fingerprint)
+    except ReupStatusError:
+        return "reconciliation_required"
+    cleanup_published_output_stage(prepared)
+    return _complete_handoff_after_output(
+        job, status_root, prepared.final_path, prepared.fingerprint,
+        output_root or config.output_dir, media_root or config.dubvi_media_dir,
+    )
+
+
+def _complete_handoff_after_output(
+    job: Mapping[str, object], status_root: Path, output_path: Path,
+    output_fingerprint: str, output_root: Path, media_root: Path,
+) -> str:
+    try:
+        handoff = publish_reup_handoff(output_path, job, media_root, output_fingerprint=output_fingerprint)
+        publish_handoff_published_status(status_root, job, output_fingerprint, handoff.handoff_id, handoff.handoff_ref)
+        publish_succeeded_status(status_root, job, output_fingerprint, handoff.handoff_id, handoff.handoff_ref)
+    except (HandoffV2Error, ReupStatusError):
+        return "handoff_pending"
+    _cleanup_output_stage_for(job, output_fingerprint, output_root)
+    return "succeeded"
+
+
+def _canonical_output_path(job: Mapping[str, object], output_root: Path) -> Path:
+    return Path(output_root) / "p1c" / str(job["reup_job_id"]) / "output.mp4"
+
+
+def _coherent_handoff_chain(output_event: Mapping[str, object] | None, handoff_event: Mapping[str, object]) -> bool:
+    return (
+        output_event is not None
+        and output_event.get("event_kind") == "output_published"
+        and output_event.get("output_fingerprint") == handoff_event.get("output_fingerprint")
+    )
+
+
+def _coherent_terminal_chain(
+    output_event: Mapping[str, object] | None,
+    handoff_event: Mapping[str, object] | None,
+    final_event: Mapping[str, object],
+) -> bool:
+    return (
+        _coherent_handoff_chain(output_event, handoff_event or {})
+        and handoff_event is not None
+        and handoff_event.get("handoff_id") == final_event.get("handoff_id")
+        and handoff_event.get("handoff_ref") == final_event.get("handoff_ref")
+        and handoff_event.get("output_fingerprint") == final_event.get("output_fingerprint")
+    )
 
 
 def _cleanup_output_stage_for(job: Mapping[str, object], fingerprint: object, output_root: Path) -> None:
@@ -141,6 +227,8 @@ def _load_recovery_event(path: Path, job: Mapping[str, object], sequence: int) -
     if payload != canonical_json_bytes(document):
         raise ReupStatusError("recovery status is not canonical bytes")
     expected_pairs = {
+        1: {("accepted", "accepted")},
+        2: {("started", "running")},
         3: {("output_published", "running"), ("failed", "failed"), ("lease_lost", "running")},
         4: {("handoff_published", "running")},
         5: {("succeeded", "succeeded")},

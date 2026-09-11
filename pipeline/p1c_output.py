@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping
@@ -20,6 +21,9 @@ class PublishedReupOutput:
     size: int
     stage_path: Path
     reused_existing: bool = False
+
+
+_OWNED_STAGE_RE = re.compile(r"^\.output\.([0-9a-f]{64})\.part$")
 
 
 def publish_reup_output(candidate: Path, job: Mapping[str, object], output_root: Path) -> PublishedReupOutput:
@@ -52,6 +56,62 @@ def publish_reup_output(candidate: Path, job: Mapping[str, object], output_root:
     return PublishedReupOutput(final, fingerprint, size, stage, False)
 
 
+def recover_prepared_reup_output(job: Mapping[str, object], output_root: Path) -> PublishedReupOutput | None:
+    """Recover one exact attempt-owned output preparation without rerendering."""
+
+    job_id = _text(job.get("reup_job_id"), "reup_job_id")
+    root = _existing_root(output_root)
+    if root is None:
+        return None
+    final_dir = root / "p1c" / job_id
+    _ensure_contained(root, final_dir)
+    if not final_dir.exists() and not final_dir.is_symlink():
+        return None
+    if final_dir.is_symlink() or not final_dir.is_dir():
+        raise OutputPublicationError("attempt output directory must be real")
+    valid: list[tuple[Path, str, int]] = []
+    for path in final_dir.iterdir():
+        match = _OWNED_STAGE_RE.fullmatch(path.name)
+        if match is None or path.is_symlink() or not path.is_file() or path.stat().st_size <= 0:
+            continue
+        fingerprint, size = _hash_file(path)
+        if fingerprint[7:] != match.group(1):
+            continue
+        valid.append((path, fingerprint, size))
+    if len(valid) > 1:
+        raise OutputPublicationError("multiple valid owned output stages exist")
+    if not valid:
+        return None
+    stage, fingerprint, size = valid[0]
+    final = final_dir / "output.mp4"
+    if final.exists() or final.is_symlink():
+        if _matches(final, fingerprint, size):
+            return PublishedReupOutput(final, fingerprint, size, stage, True)
+        raise OutputPublicationError("FINAL_PATH_CONFLICT")
+    try:
+        os.link(stage, final)
+    except FileExistsError:
+        if _matches(final, fingerprint, size):
+            return PublishedReupOutput(final, fingerprint, size, stage, True)
+        raise OutputPublicationError("FINAL_PATH_CONFLICT")
+    except OSError as error:
+        raise OutputPublicationError(f"output publication failed: {error}") from error
+    if not _matches(final, fingerprint, size):
+        raise OutputPublicationError("recovered output failed verification")
+    return PublishedReupOutput(final, fingerprint, size, stage, False)
+
+
+def verify_reup_output(output_path: Path, output_fingerprint: str) -> tuple[str, int]:
+    """Verify one canonical published output without creating or changing files."""
+
+    if output_path.is_symlink() or not output_path.is_file() or output_path.stat().st_size <= 0:
+        raise OutputPublicationError("canonical Reup output is absent or unsafe")
+    actual, size = _hash_file(output_path)
+    if actual != output_fingerprint:
+        raise OutputPublicationError("canonical Reup output fingerprint differs")
+    return actual, size
+
+
 def cleanup_published_output_stage(published: PublishedReupOutput) -> None:
     try:
         published.stage_path.unlink(missing_ok=True)
@@ -65,6 +125,14 @@ def _real_root(root: Path) -> Path:
             raise OutputPublicationError("REUP_OUTPUT_DIR must be a real directory")
     else:
         root.mkdir(parents=True, exist_ok=False)
+    return root.resolve()
+
+
+def _existing_root(root: Path) -> Path | None:
+    if not root.exists() and not root.is_symlink():
+        return None
+    if root.is_symlink() or not root.is_dir():
+        raise OutputPublicationError("REUP_OUTPUT_DIR must be a real directory")
     return root.resolve()
 
 

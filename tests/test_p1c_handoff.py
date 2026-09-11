@@ -11,7 +11,7 @@ import unittest
 import uuid
 
 from pipeline.dubvi_engine_contract import canonical_json_bytes, validate_reup_to_translator_handoff
-from pipeline.p1c_handoff import HandoffV2Error, publish_reup_handoff
+from pipeline.p1c_handoff import HandoffV2Error, publish_reup_handoff, verify_reup_handoff
 
 
 def _job() -> dict[str, object]:
@@ -67,6 +67,27 @@ class P1CHandoffV2Tests(unittest.TestCase):
         validated = module.validate_reup_to_translator_handoff(json.loads(published.sidecar_path.read_text(encoding="utf-8")))
         self.assertEqual(2, validated["handoff_schema_version"])
         self.assertNotIn("translator_job_id", validated)
+
+    def test_side_effect_free_verifier_accepts_exact_existing_handoff(self) -> None:
+        published = publish_reup_handoff(self.output, self.job, self.root / "media", output_fingerprint=self.fingerprint)
+        before_video = published.video_path.read_bytes()
+        before_sidecar = published.sidecar_path.read_bytes()
+        verified = verify_reup_handoff(
+            self.output, self.job, self.root / "media", output_fingerprint=self.fingerprint,
+            expected_handoff_id=published.handoff_id, expected_handoff_ref=published.handoff_ref,
+        )
+        self.assertEqual(published.handoff_id, verified.handoff_id)
+        self.assertEqual(before_video, published.video_path.read_bytes())
+        self.assertEqual(before_sidecar, published.sidecar_path.read_bytes())
+
+    def test_noncanonical_semantically_equal_sidecar_is_never_reused(self) -> None:
+        published = publish_reup_handoff(self.output, self.job, self.root / "media", output_fingerprint=self.fingerprint)
+        document = json.loads(published.sidecar_path.read_text(encoding="utf-8"))
+        published.sidecar_path.write_text(json.dumps(document, indent=2), encoding="utf-8")
+        with self.assertRaises(HandoffV2Error):
+            verify_reup_handoff(self.output, self.job, self.root / "media", output_fingerprint=self.fingerprint)
+        with self.assertRaises(HandoffV2Error):
+            publish_reup_handoff(self.output, self.job, self.root / "media", output_fingerprint=self.fingerprint)
 
     def test_different_existing_video_is_never_overwritten(self) -> None:
         media = self.root / "media" / self.job["reup_profile"]

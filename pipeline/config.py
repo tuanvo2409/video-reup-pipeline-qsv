@@ -17,7 +17,9 @@ def _path_from_env(name: str, default: Path) -> Path:
 class PipelineConfig:
     """System configuration for video pipeline processing."""
     # Directory paths
-    input_dir: Path = BASE_DIR / "input"
+    # CP may place canonical envelopes outside this checkout; keep the repo
+    # input directory as the portable fallback when no override is configured.
+    input_dir: Path = field(default_factory=lambda: _path_from_env("DUBVI_REUP_INPUT_DIR", BASE_DIR / "input"))
     processing_dir: Path = BASE_DIR / "processing"
     # Output is portable by default and can be redirected for an installed worker.
     output_dir: Path = field(default_factory=lambda: _path_from_env("REUP_OUTPUT_DIR", BASE_DIR / "output"))

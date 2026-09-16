@@ -1,7 +1,7 @@
 import os
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import List, Literal
+from typing import Dict, List, Literal
 
 # Base workspace directory
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -30,6 +30,19 @@ class PipelineConfig:
     frames_dir: Path = BASE_DIR / "assets" / "frames"
     watermarks_dir: Path = BASE_DIR / "assets" / "watermarks"
     default_watermark: Path = BASE_DIR / "assets" / "watermarks" / "default_invisible_mask.jpg"
+    # Approved CP-carried Reup IDs map to the recovery-proven asset locations.
+    # Keep this explicit: profile IDs must never be normalized into folder names.
+    approved_profile_assets: Dict[str, Dict[str, str]] = field(default_factory=lambda: {
+        "page_goc_tro_bat_on": {
+            "directory": "profiles/page_goc tro bat on",
+            "watermark": "watermarks/mask_hang_den.png",
+        },
+        "page_giai_cuu_chuong_lon": {
+            "directory": "profiles/page_giai cuu chuong lon",
+            "watermark": "watermarks/mask_hang_trang.jpg",
+        },
+    })
+    approved_profile_speed_range: tuple[float, float] = (1.08, 1.15)
     log_file: Path = BASE_DIR / "system.log"
 
     # DUBVI Bridge Directory (Giai đoạn 2). This intentionally shares the

@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import sys
 import unittest
+from types import SimpleNamespace
 from unittest.mock import patch
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -14,7 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 from pipeline.p1c_lease_client import LeaseBridgeResponse, LeaseBridgeUnavailable
 from pipeline.p1c_status import ReupStatusError, publish_accepted_status
-from pipeline.p1c_worker import run_lease_aware_work
+from pipeline.p1c_worker import WorkerResult, run_canonical_once, run_lease_aware_work
 
 
 JOB_ID = "11111111-1111-4111-8111-111111111111"; DISPATCH_ID = "22222222-2222-4222-8222-222222222222"; LEASE_ID = "33333333-3333-4333-8333-333333333333"
@@ -89,6 +90,22 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual("work_completed_lease_released", result.outcome)
         self.assertTrue((self.root / "reup" / JOB_ID / "event-000002.json").is_file())
 
+    def test_completed_child_is_reaped_without_waiting_for_heartbeat(self):
+        sleeps = []
+        released = []
+        handle = Handle(running=True)
+        class Client:
+            def acquire(_, job): return response("acquire", granted=True)
+            def heartbeat(_, job, lease_id): raise AssertionError("completed child needs no heartbeat")
+            def release(_, job, lease_id): released.append(lease_id); return response("release")
+        def sleep(seconds):
+            sleeps.append(seconds)
+            handle.running = False
+        result = run_lease_aware_work(self.job, self.root, Client(), lambda job: handle, monotonic=lambda: 0.0, sleep=sleep, utc_now=lambda: "2026-09-11T00:00:01.000Z")
+        self.assertEqual("work_completed_lease_released", result.outcome)
+        self.assertEqual([LEASE_ID], released)
+        self.assertLessEqual(max(sleeps), 0.25)
+
     def test_heartbeat_loss_terminates_only_owned_handle(self):
         class Client:
             def acquire(_, job): return response("acquire", granted=True)
@@ -97,6 +114,54 @@ class WorkerTests(unittest.TestCase):
         result = run_lease_aware_work(self.job, self.root, Client(), lambda job: handle, monotonic=lambda: next(ticks), sleep=lambda _: None)
         self.assertEqual("lease_lost", result.outcome); self.assertTrue(handle.terminated)
         self.assertTrue((self.root / "reup" / JOB_ID / "event-000003.json").is_file())
+
+    def test_first_run_failed_event_reports_failed_after_child_exit(self):
+        calls = {3: 0}
+        failed_event = {"event_kind": "failed", "state": "failed", "lease_id": LEASE_ID}
+
+        def existing_event(_status_root, _job, sequence):
+            if sequence == 3:
+                calls[3] += 1
+                return failed_event if calls[3] > 1 else None
+            return None
+
+        envelope_path = self.root / f"dubvi-reup-job-{JOB_ID}.job.json"
+        accepted = SimpleNamespace(document=self.job, envelope_path=envelope_path)
+        with patch("pipeline.p1c_worker._require_input_root", return_value=self.root), patch(
+            "pipeline.p1c_worker._require_status_configuration", return_value=self.root
+        ), patch("pipeline.p1c_worker.iter_reup_envelopes", return_value=(envelope_path,)), patch(
+            "pipeline.p1c_worker.load_reup_envelope", return_value=self.job
+        ), patch("pipeline.p1c_worker.accept_reup_envelope", return_value=accepted), patch(
+            "pipeline.p1c_worker._optional_status_event", side_effect=existing_event
+        ), patch("pipeline.p1c_worker.LeaseBridgeClient.from_environment"), patch(
+            "pipeline.p1c_worker.run_lease_aware_work",
+            return_value=WorkerResult("work_completed_lease_released", LEASE_ID),
+        ):
+            report = run_canonical_once(reup_job_id=JOB_ID)
+
+        self.assertEqual("failed", report["outcome"])
+        self.assertEqual("work_completed_lease_released", report["worker_outcome"])
+        self.assertEqual(LEASE_ID, report["lease_id"])
+        self.assertEqual("failed", report["terminal_event"])
+
+    def test_exit_without_failed_event_remains_reconciliation_required(self):
+        envelope_path = self.root / f"dubvi-reup-job-{JOB_ID}.job.json"
+        accepted = SimpleNamespace(document=self.job, envelope_path=envelope_path)
+        with patch("pipeline.p1c_worker._require_input_root", return_value=self.root), patch(
+            "pipeline.p1c_worker._require_status_configuration", return_value=self.root
+        ), patch("pipeline.p1c_worker.iter_reup_envelopes", return_value=(envelope_path,)), patch(
+            "pipeline.p1c_worker.load_reup_envelope", return_value=self.job
+        ), patch("pipeline.p1c_worker.accept_reup_envelope", return_value=accepted), patch(
+            "pipeline.p1c_worker._optional_status_event", return_value=None
+        ), patch("pipeline.p1c_worker.LeaseBridgeClient.from_environment"), patch(
+            "pipeline.p1c_worker.run_lease_aware_work",
+            return_value=WorkerResult("work_completed_lease_released", LEASE_ID),
+        ):
+            report = run_canonical_once(reup_job_id=JOB_ID)
+
+        self.assertEqual("reconciliation_required", report["outcome"])
+        self.assertEqual("work_completed_lease_released", report["worker_outcome"])
+        self.assertEqual(LEASE_ID, report["lease_id"])
 
 
 if __name__ == "__main__": unittest.main()

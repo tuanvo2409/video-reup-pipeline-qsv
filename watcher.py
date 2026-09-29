@@ -1,7 +1,12 @@
 import argparse
+import errno
 import logging
+import shutil
 import sys
+import threading
 import time
+import uuid
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import List, Optional
@@ -15,8 +20,10 @@ from pipeline.cache_manager import (
     cleanup_stale_processing,
     clear_cache_history,
     get_cache_stats,
+    _unique_recovery_path,
 )
 from pipeline.input_rules import is_legacy_media_input
+from pipeline.p1c_lease_client import LeaseBridgeClient, LeaseBridgeUnavailable
 
 # Setup root logging
 logging.basicConfig(
@@ -28,6 +35,153 @@ logging.basicConfig(
     ]
 )
 logger = logging.getLogger("VideoPipeline.Watcher")
+
+
+def _positive_workers(value: str) -> int:
+    workers = int(value)
+    if workers <= 0:
+        raise argparse.ArgumentTypeError("workers must be a positive integer")
+    return workers
+
+
+def _contain_future_failure(source_path: Path, error: BaseException) -> ProcessResult:
+    """Contain one legacy item failure without overwriting another recovery."""
+    if source_path.is_file() and not source_path.is_symlink():
+        config.failed_dir.mkdir(parents=True, exist_ok=True)
+        recovery_path = _unique_recovery_path(config.failed_dir, source_path.name)
+        if recovery_path.exists():
+            logger.warning("[WATCHER] Skipped recovery for '%s': destination exists", source_path.name)
+        else:
+            try:
+                shutil.move(str(source_path), str(recovery_path))
+                logger.warning("[WATCHER] Quarantined failed source '%s'", recovery_path.name)
+            except OSError:
+                logger.warning("[WATCHER] Could not quarantine failed source '%s'", source_path.name)
+    logger.warning("[WATCHER] Item '%s' failed (%s)", source_path.name, type(error).__name__)
+    return ProcessResult(
+        success=False,
+        input_file=source_path,
+        error_message=f"worker failure: {type(error).__name__}",
+    )
+
+
+@contextmanager
+def _watcher_instance_lock():
+    lock_path = config.processing_dir.parent / "watcher.lock"
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    lock_file = lock_path.open("a+b")
+    acquired = False
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+
+            lock_file.seek(0, 2)
+            if lock_file.tell() == 0:
+                lock_file.write(b"0")
+                lock_file.flush()
+            lock_file.seek(0)
+            try:
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+            except PermissionError:
+                logger.warning("Another legacy watcher instance is already running; exiting.")
+                yield False
+                return
+        else:
+            import fcntl
+
+            try:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                logger.warning("Another legacy watcher instance is already running; exiting.")
+                yield False
+                return
+        acquired = True
+        yield True
+    finally:
+        if acquired:
+            if sys.platform == "win32":
+                import msvcrt
+
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+        lock_file.close()
+
+
+@contextmanager
+def acquire_heavy_media_lease():
+    """Acquire HEAVY_MEDIA lease from Control Plane if available, protecting CPU/GPU limits.
+
+    Gracefully falls back to local execution if Control Plane bridge is not configured.
+    """
+    client: Optional[LeaseBridgeClient] = None
+    try:
+        client = LeaseBridgeClient.from_environment()
+    except LeaseBridgeUnavailable:
+        sibling = Path(__file__).resolve().parents[1] / "dubvi-control-plane"
+        if (sibling / "src" / "dubvi_control_plane").is_dir():
+            try:
+                client = LeaseBridgeClient(sibling)
+            except LeaseBridgeUnavailable:
+                client = None
+
+    if client is None:
+        logger.info("[LEASE] Control plane bridge not configured; proceeding with local lock.")
+        yield True
+        return
+
+    job_id = str(uuid.uuid4())
+    dispatch_id = str(uuid.uuid4())
+    job = {"reup_job_id": job_id, "dispatch_id": dispatch_id}
+
+    try:
+        admission = client.acquire(job)
+    except LeaseBridgeUnavailable as exc:
+        logger.warning("[LEASE] Control plane bridge unavailable (%s); proceeding with local lock.", exc)
+        yield True
+        return
+
+    if not admission.granted or admission.lease is None:
+        logger.warning("[LEASE] HEAVY_MEDIA capacity unavailable (active lease exists); deferring execution.")
+        yield False
+        return
+
+    lease_id = str(admission.lease["lease_id"])
+    logger.info("[LEASE] Acquired HEAVY_MEDIA lease %s (heartbeat every %ss)", lease_id, admission.heartbeat_seconds)
+
+    stop_event = threading.Event()
+    heartbeat_interval = max(1, admission.heartbeat_seconds)
+
+    def _heartbeat_loop():
+        while not stop_event.wait(timeout=heartbeat_interval):
+            try:
+                renewed = client.heartbeat(job, lease_id)
+                if renewed.lease is None:
+                    logger.warning("[LEASE] HEAVY_MEDIA lease renewal rejected.")
+                    break
+            except LeaseBridgeUnavailable as hb_err:
+                logger.warning("[LEASE] HEAVY_MEDIA heartbeat error: %s", hb_err)
+                break
+
+    heartbeat_thread = threading.Thread(target=_heartbeat_loop, daemon=True, name="lease-heartbeat")
+    heartbeat_thread.start()
+
+    try:
+        yield True
+    finally:
+        stop_event.set()
+        heartbeat_thread.join(timeout=2.0)
+        try:
+            client.release(job, lease_id)
+            logger.info("[LEASE] Released HEAVY_MEDIA lease %s", lease_id)
+        except LeaseBridgeUnavailable as rel_err:
+            logger.warning("[LEASE] Failed to release HEAVY_MEDIA lease %s: %s", lease_id, rel_err)
+
 
 def scan_input_files() -> List[Path]:
     """Scan the input directory and all channel subdirectories for supported video files."""
@@ -83,47 +237,54 @@ def run_batch(
     start_batch_time = time.time()
 
     results: List[ProcessResult] = []
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(
-                process_single_video,
-                f,
-                override_profile,
-                target_platform,
-                override_encoder,
-                override_mode,
-                enable_mask,
-                mask_ratio,
-                enable_frame,
-                enable_invisible_mask,
-                invisible_mask_opacity,
-                enable_hflip,
-                enable_grain,
-                enable_jitter,
-                enable_smart_scenes,
-                enable_tempo,
-                custom_tempo,
-                custom_zoom,
-                enable_trim,
-                custom_trim_start,
-                custom_trim_end,
-                send_to_dubvi,
-                force_reprocess,
-            ): f
-            for f in files
-        }
+    with acquire_heavy_media_lease() as lease_granted:
+        if not lease_granted:
+            return
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(
+                    process_single_video,
+                    f,
+                    override_profile,
+                    target_platform,
+                    override_encoder,
+                    override_mode,
+                    enable_mask,
+                    mask_ratio,
+                    enable_frame,
+                    enable_invisible_mask,
+                    invisible_mask_opacity,
+                    enable_hflip,
+                    enable_grain,
+                    enable_jitter,
+                    enable_smart_scenes,
+                    enable_tempo,
+                    custom_tempo,
+                    custom_zoom,
+                    enable_trim,
+                    custom_trim_start,
+                    custom_trim_end,
+                    send_to_dubvi,
+                    force_reprocess,
+                ): f
+                for f in files
+            }
 
-        for future in as_completed(futures):
-            res = future.result()
-            results.append(res)
-            status_str = "SUCCESS" if res.success else "FAILED"
-            if res.cache_hit:
-                status_str = "CACHE_HIT"
-            dubvi_tag = " -> [DUBVI Ready]" if res.dubvi_forwarded else ""
-            logger.info(
-                f"[{status_str}] [{res.profile_name} | {res.platform_name}] Finished '{res.input_file.name}' in {res.duration_seconds:.2f}s | "
-                f"{res.vpdq_score_info or ''}{dubvi_tag}"
-            )
+            for future in as_completed(futures):
+                source_path = futures[future]
+                try:
+                    res = future.result()
+                except Exception as error:
+                    res = _contain_future_failure(source_path, error)
+                results.append(res)
+                status_str = "SUCCESS" if res.success else "FAILED"
+                if res.cache_hit:
+                    status_str = "CACHE_HIT"
+                dubvi_tag = " -> [DUBVI Ready]" if res.dubvi_forwarded else ""
+                logger.info(
+                    f"[{status_str}] [{res.profile_name} | {res.platform_name}] Finished '{res.input_file.name}' in {res.duration_seconds:.2f}s | "
+                    f"{res.vpdq_score_info or ''}{dubvi_tag}"
+                )
 
     total_time = time.time() - start_batch_time
     success_count = sum(1 for r in results if r.success)
@@ -172,44 +333,52 @@ def run_watch_daemon(
             files = scan_input_files()
             if files:
                 logger.info(f"Detected {len(files)} new file(s) across channels. Dispatching to queue...")
-                with ThreadPoolExecutor(max_workers=max_workers) as executor:
-                    futures = [
-                        executor.submit(
-                            process_single_video,
-                            f,
-                            override_profile,
-                            target_platform,
-                            override_encoder,
-                            override_mode,
-                            enable_mask,
-                            mask_ratio,
-                            enable_frame,
-                            enable_invisible_mask,
-                            invisible_mask_opacity,
-                            enable_hflip,
-                            enable_grain,
-                            enable_jitter,
-                            enable_smart_scenes,
-                            enable_tempo,
-                            custom_tempo,
-                            custom_zoom,
-                            enable_trim,
-                            custom_trim_start,
-                            custom_trim_end,
-                            send_to_dubvi,
-                            force_reprocess,
-                        )
-                        for f in files
-                    ]
-                    for f in as_completed(futures):
-                        _ = f.result()
+                with acquire_heavy_media_lease() as lease_granted:
+                    if not lease_granted:
+                        time.sleep(poll_interval)
+                        continue
+                    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+                        futures = {
+                            executor.submit(
+                                process_single_video,
+                                f,
+                                override_profile,
+                                target_platform,
+                                override_encoder,
+                                override_mode,
+                                enable_mask,
+                                mask_ratio,
+                                enable_frame,
+                                enable_invisible_mask,
+                                invisible_mask_opacity,
+                                enable_hflip,
+                                enable_grain,
+                                enable_jitter,
+                                enable_smart_scenes,
+                                enable_tempo,
+                                custom_tempo,
+                                custom_zoom,
+                                enable_trim,
+                                custom_trim_start,
+                                custom_trim_end,
+                                send_to_dubvi,
+                                force_reprocess,
+                            ): f
+                            for f in files
+                        }
+                        for f in as_completed(futures):
+                            source_path = futures[f]
+                            try:
+                                f.result()
+                            except Exception as error:
+                                _contain_future_failure(source_path, error)
             time.sleep(poll_interval)
     except KeyboardInterrupt:
         logger.info("Daemon watcher stopped by user.")
 
 def main():
     parser = argparse.ArgumentParser(
-        description="High-Performance Multi-Platform Video Pipeline with Smart Cache, PySceneDetect, vPDQ, and Intel QSV"
+        description="High-Performance Multi-Platform Video Pipeline with Smart Cache, PySceneDetect, sampled-frame dHash similarity heuristic, and Intel QSV"
     )
     parser.add_argument(
         "--watch",
@@ -258,7 +427,7 @@ def main():
     )
     parser.add_argument(
         "--workers",
-        type=int,
+        type=_positive_workers,
         default=config.max_workers,
         help=f"Number of parallel video workers (default: {config.max_workers})"
     )
@@ -364,7 +533,7 @@ def main():
         "--score",
         nargs=2,
         metavar=("ORIGINAL", "PROCESSED"),
-        help="Calculate Meta vPDQ similarity score between two videos and exit"
+        help="Calculate sampled-frame dHash similarity heuristic between two videos and exit"
     )
 
     args = parser.parse_args()
@@ -383,12 +552,12 @@ def main():
 
     if args.score:
         res = score_video_pair(Path(args.score[0]), Path(args.score[1]))
-        print(f"\n[Meta vPDQ Assessment]")
-        print(f"• Original: {res['original_file']}")
-        print(f"• Processed: {res['processed_file']}")
-        print(f"• Similarity: {res['similarity_percent']}%")
-        print(f"• Status: {res['status']}")
-        print(f"• Verdict: {res['verdict']}\n")
+        print(f"\n[Sampled-frame dHash similarity heuristic]")
+        print(f"• Original: {res.get('original_file', args.score[0])}")
+        print(f"• Processed: {res.get('processed_file', args.score[1])}")
+        print(f"• Similarity: {res.get('similarity_percent', 0.0)}%")
+        print(f"• Status: {res.get('status', 'UNKNOWN')}")
+        print(f"• Verdict: {res.get('verdict', res.get('message', 'UNKNOWN'))}\n")
         return
 
     if args.check_hw:
@@ -433,10 +602,13 @@ def main():
         "force_reprocess": args.force,
     }
 
-    if args.watch:
-        run_watch_daemon(**params)
-    else:
-        run_batch(**params)
+    with _watcher_instance_lock() as acquired:
+        if not acquired:
+            return
+        if args.watch:
+            run_watch_daemon(**params)
+        else:
+            run_batch(**params)
 
 if __name__ == "__main__":
     main()

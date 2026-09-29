@@ -77,7 +77,8 @@ def run_lease_aware_work(job: Mapping[str, object], status_root, lease_client, s
                 pass
             return WorkerResult("lease_lost", lease_id)
         if monotonic() < next_heartbeat:
-            sleep(max(0.0, next_heartbeat - monotonic()))
+            sleep(min(0.25, max(0.0, next_heartbeat - monotonic())))
+            continue
         try:
             renewed = lease_client.heartbeat(job, lease_id)
             if renewed.lease is None:
@@ -197,6 +198,14 @@ def run_canonical_once(*, reup_job_id: str | None = None) -> dict[str, object]:
         )
         terminal = _optional_status_event(status_root, document, 5)
         output_event = _optional_status_event(status_root, document, 3)
+        if terminal is None and output_event is not None and output_event.get("event_kind") == "failed":
+            return _reup_report(
+                document,
+                outcome="failed",
+                worker_outcome=result.outcome,
+                lease_id=result.lease_id,
+                terminal=output_event,
+            )
         if terminal is None and (
             output_event is not None and output_event.get("event_kind") == "output_published"
         ):

@@ -136,6 +136,15 @@ def verify_reup_handoff(
 
 def _copy_link(source: Path, final: Path, fingerprint: str) -> None:
     stage = final.with_name(f".{final.name}.{fingerprint[7:19]}.part")
+    if stage.is_symlink():
+        stage.unlink(missing_ok=True)
+    elif stage.exists():
+        try:
+            valid_stage = _hash(stage)[0] == fingerprint
+        except OSError:
+            valid_stage = False
+        if not valid_stage:
+            stage.unlink(missing_ok=True)
     if not stage.exists():
         with source.open("rb") as src, stage.open("xb") as dst:
             while chunk := src.read(1024 * 1024): dst.write(chunk)

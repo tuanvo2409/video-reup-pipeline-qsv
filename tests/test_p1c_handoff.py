@@ -106,6 +106,21 @@ class P1CHandoffV2Tests(unittest.TestCase):
         with self.assertRaisesRegex(HandoffV2Error, "FINAL_PATH_CONFLICT"):
             publish_reup_handoff(self.output, self.job, self.root / "media", output_fingerprint=self.fingerprint)
 
+    def test_corrupt_owned_part_does_not_block_retry(self) -> None:
+        media_root = self.root / "media"
+        profile_dir = media_root / self.job["reup_profile"]
+        profile_dir.mkdir(parents=True)
+        stage = profile_dir / f".reup-{self.job['reup_job_id']}.mp4.{self.fingerprint[7:19]}.part"
+        stage.write_bytes(b"corrupt-owned-stage")
+
+        published = publish_reup_handoff(
+            self.output, self.job, media_root, output_fingerprint=self.fingerprint
+        )
+
+        self.assertEqual(self.output.read_bytes(), published.video_path.read_bytes())
+        self.assertFalse(stage.exists())
+        self.assertTrue(published.sidecar_path.is_file())
+
 
 if __name__ == "__main__":
     unittest.main()

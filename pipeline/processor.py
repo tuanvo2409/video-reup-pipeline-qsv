@@ -19,6 +19,8 @@ from pipeline.cache_manager import (
     is_already_processed,
     record_processed_video,
     get_file_md5_quick,
+    make_transform_signature,
+    _unique_recovery_path,
 )
 from pipeline.dubvi_handoff import HandoffPublicationError, publish_dubvi_handoff
 
@@ -45,6 +47,15 @@ class ProcessResult:
     dubvi_forwarded: bool = False
     handoff_error: Optional[str] = None
     error_message: Optional[str] = None
+
+
+def _cache_transform_signature(
+    profile_name: str,
+    platform_name: str,
+    transform_options: Dict[str, Any],
+    config_obj: Any,
+) -> str:
+    return make_transform_signature(profile_name, platform_name, transform_options, config_obj)
 
 def get_video_duration(file_path: Path) -> float:
     """Get the duration of a video in seconds using ffprobe."""
@@ -76,6 +87,47 @@ def pick_random_asset(folder: Optional[Path], valid_extensions: tuple) -> Option
     files = [f for f in folder.iterdir() if f.is_file() and f.suffix.lower() in valid_extensions]
     return random.choice(files) if files else None
 
+
+def _cache_is_safe_for_transform(
+    config_obj: Any,
+    enable_trim: Optional[bool],
+    enable_smart_scenes: Optional[bool],
+    enable_jitter: Optional[bool],
+    enable_tempo: Optional[bool],
+    custom_tempo: Optional[float],
+    custom_zoom: Optional[float],
+    custom_trim_start: Optional[float],
+    custom_trim_end: Optional[float],
+    selected_assets: tuple[Optional[Path], ...],
+) -> bool:
+    """Permit cache hits only when all output-affecting choices are signed."""
+    effective_trim = config_obj.enable_trim if enable_trim is None else enable_trim
+    effective_smart_scenes = config_obj.enable_smart_scenes if enable_smart_scenes is None else enable_smart_scenes
+    effective_jitter = config_obj.enable_jitter if enable_jitter is None else enable_jitter
+    effective_tempo = config_obj.enable_tempo_shift if enable_tempo is None else enable_tempo
+    if custom_zoom is None and config_obj.zoom_min != config_obj.zoom_max:
+        return False
+    if effective_tempo and custom_tempo is None:
+        return False
+    if effective_jitter:
+        return False
+    if effective_trim and (custom_trim_start is None or custom_trim_end is None):
+        return False
+    if effective_smart_scenes:
+        return False
+    for asset in selected_assets:
+        if asset is None:
+            continue
+        if not asset.is_file():
+            return False
+        try:
+            with asset.open("rb") as asset_file:
+                asset_file.read(1)
+        except OSError:
+            return False
+    return True
+
+
 def process_single_video(
     source_path: Path,
     override_profile: Optional[str] = None,
@@ -99,6 +151,8 @@ def process_single_video(
     custom_trim_end: Optional[float] = None,
     send_to_dubvi: Optional[bool] = None,
     force_reprocess: bool = False,
+    working_dir: Optional[Path] = None,
+    output_root: Optional[Path] = None,
 ) -> ProcessResult:
     """
     Process a single video with Multi-Profile and Platform-Adaptive Preset support.
@@ -106,6 +160,8 @@ def process_single_video(
     start_time = time.time()
     do_send_dubvi = config.auto_send_to_dubvi if send_to_dubvi is None else send_to_dubvi
     config.ensure_dirs(include_dubvi=do_send_dubvi)
+    effective_output_root = output_root or config.output_dir
+    effective_output_root.mkdir(parents=True, exist_ok=True)
 
     # Determine channel profile from subfolder or override
     profile_name = "default"
@@ -118,7 +174,8 @@ def process_single_video(
             rel = source_path.relative_to(config.input_dir)
             if len(rel.parts) > 2:
                 profile_name = rel.parts[0]
-                detected_platform = rel.parts[1]
+                if target_platform is None:
+                    detected_platform = rel.parts[1]
             elif len(rel.parts) == 2:
                 profile_name = rel.parts[0]
         except Exception:
@@ -127,17 +184,78 @@ def process_single_video(
     profile: ChannelProfile = get_channel_profile(profile_name)
     platform_preset: PlatformPreset = get_platform_preset(detected_platform)
 
+    # Resolve the same assets and encoder that the renderer will use before
+    # checking cache identity. Asset bytes and the effective encoder affect the
+    # rendered output, even when their paths/options remain unchanged.
+    mascot_file = profile.mascot_path or pick_random_asset(config.mascots_dir, (".webm", ".mov", ".png"))
+    hook_file = pick_random_asset(profile.hooks_dir, config.supported_extensions) or pick_random_asset(config.hooks_dir, config.supported_extensions)
+    outro_file = pick_random_asset(profile.outros_dir, config.supported_extensions) or pick_random_asset(config.outros_dir, config.supported_extensions)
+    bgm_file = pick_random_asset(profile.bgm_dir, config.supported_audio_extensions) or pick_random_asset(config.bgm_dir, config.supported_audio_extensions)
+    frame_file = pick_random_asset(config.frames_dir, config.supported_image_extensions)
+    watermark_file = profile.watermark_path or pick_random_asset(config.watermarks_dir, config.supported_image_extensions) or (
+        config.default_watermark if config.default_watermark.exists() else None
+    )
+    encoder = override_encoder or detect_best_encoder()
+    cache_transform_signature = _cache_transform_signature(
+        profile_name,
+        platform_preset.name,
+        {
+            "profile": profile.__dict__,
+            "platform": platform_preset.__dict__,
+            "effective_encoder": encoder,
+            "override_mode": override_mode,
+            "enable_mask": enable_mask,
+            "mask_ratio": mask_ratio,
+            "enable_frame": enable_frame,
+            "enable_invisible_mask": enable_invisible_mask,
+            "invisible_mask_opacity": invisible_mask_opacity,
+            "enable_hflip": enable_hflip,
+            "enable_grain": enable_grain,
+            "enable_jitter": enable_jitter,
+            "enable_smart_scenes": enable_smart_scenes,
+            "enable_tempo": enable_tempo,
+            "custom_tempo": custom_tempo,
+            "custom_zoom": custom_zoom,
+            "enable_trim": enable_trim,
+            "custom_trim_start": custom_trim_start,
+            "custom_trim_end": custom_trim_end,
+            "selected_assets": {
+                "mascot": mascot_file,
+                "hook": hook_file,
+                "outro": outro_file,
+                "bgm": bgm_file,
+                "frame": frame_file,
+                "watermark": watermark_file,
+            },
+        },
+        config,
+    )
+    cache_is_safe = _cache_is_safe_for_transform(
+        config,
+        enable_trim,
+        enable_smart_scenes,
+        enable_jitter,
+        enable_tempo,
+        custom_tempo,
+        custom_zoom,
+        custom_trim_start,
+        custom_trim_end,
+        (mascot_file, hook_file, outro_file, bgm_file, frame_file, watermark_file),
+    )
+
     # 1. Smart Cache Lookup
-    cache_key_file = source_path
-    if not force_reprocess and source_path.exists():
-        cached_info = is_already_processed(source_path)
+    if cache_is_safe and not force_reprocess and not do_send_dubvi and source_path.exists():
+        cached_info = is_already_processed(
+            source_path,
+            transform_signature=cache_transform_signature,
+            output_root=effective_output_root,
+        )
         if cached_info:
             out_file_path = Path(cached_info["output_path"])
             logger.info(
                 f"[CACHE HIT] [{profile_name} | {platform_preset.name}] '{source_path.name}' was already processed on {cached_info['processed_at']}. "
                 f"Skipping render. (Use --force to re-render fresh variations)."
             )
-            source_path.unlink(missing_ok=True)
             return ProcessResult(
                 success=True,
                 input_file=source_path,
@@ -148,12 +266,17 @@ def process_single_video(
                 profile_name=profile_name,
                 platform_name=platform_preset.name,
                 cache_hit=True,
-                vpdq_score_info=f"Cached vPDQ: {cached_info.get('vpdq_score')}% [{cached_info.get('vpdq_status')}]",
+                vpdq_score_info=(
+                    "Cached sampled-frame dHash heuristic: "
+                    f"{cached_info.get('vpdq_score')}% [{cached_info.get('vpdq_status')}]"
+                ),
             )
 
     # 2. Move from input to processing
+    processing_dir = working_dir or config.processing_dir
+    processing_dir.mkdir(parents=True, exist_ok=True)
     temp_filename = f"{profile_name}_{platform_preset.name}_{source_path.name}"
-    temp_processing_path = config.processing_dir / temp_filename
+    temp_processing_path = processing_dir / temp_filename
     try:
         shutil.move(str(source_path), str(temp_processing_path))
     except Exception as e:
@@ -204,26 +327,15 @@ def process_single_video(
                 speed_info_str = f"Smart Scenes: {len(scene_schedule)} cuts ({', '.join(speeds_sample)}...)"
 
     # Output paths (Categorized by Channel Profile folder)
-    target_out_dir = config.output_dir / profile_name if profile_name != "default" else config.output_dir
+    target_out_dir = effective_output_root / profile_name if profile_name != "default" else effective_output_root
     target_out_dir.mkdir(parents=True, exist_ok=True)
     
     suffix_tag = f"_{platform_preset.name}" if platform_preset.name != "universal" else ""
     output_filename = f"processed_{source_path.stem}{suffix_tag}.mp4"
     final_output_path = target_out_dir / output_filename
     meta_output_path = target_out_dir / f"processed_{source_path.stem}{suffix_tag}.meta.json"
-    temp_output_path = config.processing_dir / f"tmp_{temp_filename}"
+    temp_output_path = processing_dir / f"tmp_{temp_filename}"
 
-    # Pick channel-specific or global assets
-    mascot_file = profile.mascot_path or pick_random_asset(config.mascots_dir, (".webm", ".mov", ".png"))
-    hook_file = pick_random_asset(profile.hooks_dir, config.supported_extensions) or pick_random_asset(config.hooks_dir, config.supported_extensions)
-    outro_file = pick_random_asset(profile.outros_dir, config.supported_extensions) or pick_random_asset(config.outros_dir, config.supported_extensions)
-    bgm_file = pick_random_asset(profile.bgm_dir, config.supported_audio_extensions) or pick_random_asset(config.bgm_dir, config.supported_audio_extensions)
-    frame_file = pick_random_asset(config.frames_dir, config.supported_image_extensions)
-    watermark_file = profile.watermark_path or pick_random_asset(config.watermarks_dir, config.supported_image_extensions) or (
-        config.default_watermark if config.default_watermark.exists() else None
-    )
-
-    encoder = override_encoder or detect_best_encoder()
     layout = override_mode or config.layout_mode
     effective_hflip = enable_hflip if enable_hflip is not None else profile.enable_hflip
     effective_inv_opacity = invisible_mask_opacity if invisible_mask_opacity is not None else profile.invisible_mask_opacity
@@ -288,7 +400,7 @@ def process_single_video(
     duration = time.time() - start_time
 
     if success:
-        vpdq_info_str = "vPDQ: Skipped"
+        vpdq_info_str = "Sampled-frame dHash heuristic: Skipped"
         vpdq_score_val = None
         vpdq_status_val = None
 
@@ -297,12 +409,14 @@ def process_single_video(
                 score_res = score_video_pair(temp_processing_path, temp_output_path)
                 vpdq_score_val = score_res["similarity_percent"]
                 vpdq_status_val = score_res["status"]
-                vpdq_info_str = f"vPDQ Match: {vpdq_score_val}% [{vpdq_status_val}]"
+                vpdq_info_str = (
+                    "Sampled-frame dHash heuristic: "
+                    f"{vpdq_score_val}% [{vpdq_status_val}]"
+                )
             except Exception as e:
-                logger.warning(f"Failed to score vPDQ: {e}")
+                logger.warning(f"Failed to compute sampled-frame dHash heuristic: {e}")
 
         shutil.move(str(temp_output_path), str(final_output_path))
-        temp_processing_path.unlink(missing_ok=True)
 
         new_md5 = get_file_md5_quick(final_output_path)
 
@@ -335,15 +449,58 @@ def process_single_video(
             logger.warning(f"Failed to write metadata json: {e}")
 
         # Record in Processed Cache History Ledger
-        record_processed_video(
-            original_md5=original_md5,
-            original_name=source_path.name,
-            output_path=final_output_path,
-            output_md5=new_md5,
-            duration_s=duration,
-            vpdq_score=vpdq_score_val,
-            vpdq_status=vpdq_status_val,
-        )
+        try:
+            record_processed_video(
+                original_md5=original_md5,
+                original_name=source_path.name,
+                output_path=final_output_path,
+                output_md5=new_md5,
+                duration_s=duration,
+                vpdq_score=vpdq_score_val,
+                vpdq_status=vpdq_status_val,
+                transform_signature=cache_transform_signature,
+            )
+        except Exception as e:
+            failed_dir = config.failed_dir / profile_name if profile_name != "default" else config.failed_dir
+            failed_dir.mkdir(parents=True, exist_ok=True)
+            preserved_raw_path = _unique_recovery_path(failed_dir, temp_processing_path.name)
+            recovery_message = f"raw preserved at {preserved_raw_path}"
+            try:
+                shutil.move(str(temp_processing_path), str(preserved_raw_path))
+            except Exception as preserve_error:
+                preserved_raw_path = temp_processing_path
+                logger.error(f"Failed to preserve raw input after ledger failure: {preserve_error}")
+                for recovery_dir in (failed_dir, config.input_dir):
+                    recovery_path = _unique_recovery_path(recovery_dir, temp_processing_path.name)
+                    try:
+                        shutil.copy2(str(temp_processing_path), str(recovery_path))
+                        temp_processing_path.unlink(missing_ok=True)
+                        preserved_raw_path = recovery_path
+                        recovery_message = f"raw preserved at {preserved_raw_path}"
+                        break
+                    except Exception as recovery_error:
+                        logger.error(f"Failed raw recovery copy to {recovery_path}: {recovery_error}")
+                else:
+                    recovery_message = f"raw remains at {temp_processing_path}; manual recovery required"
+            logger.error(f"Cache ledger write failed for '{source_path.name}': {e}")
+            return ProcessResult(
+                success=False,
+                input_file=source_path,
+                output_file=final_output_path,
+                duration_seconds=duration,
+                original_md5=original_md5,
+                output_md5=new_md5,
+                encoder_used=encoder,
+                layout_mode=layout,
+                trimmed_info=trimmed_str,
+                zoom_info=f"Zoom: {builder.zoom:.3f}x",
+                speed_info=speed_info_str,
+                profile_name=profile_name,
+                platform_name=platform_preset.name,
+                error_message=f"Cache ledger write failed; {recovery_message}: {e}",
+            )
+
+        temp_processing_path.unlink(missing_ok=True)
 
         # Auto forward to DUBVI media folder if requested
         dubvi_forwarded = False
@@ -383,7 +540,7 @@ def process_single_video(
     else:
         failed_dir = config.failed_dir / profile_name if profile_name != "default" else config.failed_dir
         failed_dir.mkdir(parents=True, exist_ok=True)
-        failed_path = failed_dir / temp_processing_path.name
+        failed_path = _unique_recovery_path(failed_dir, temp_processing_path.name)
         shutil.move(str(temp_processing_path), str(failed_path))
         logger.error(f"Failed to process '{source_path.name}'. Moved to failed/. Error: {last_error}")
         return ProcessResult(

@@ -13,6 +13,27 @@ def _path_from_env(name: str, default: Path) -> Path:
     return Path(value).expanduser() if value else default
 
 
+def _runtime_dir(name: str, default: Path) -> Path:
+    """Place runtime state under an explicit disposable output root when configured."""
+    value = os.getenv("REUP_OUTPUT_DIR")
+    return Path(value).expanduser() / name if value else default
+
+
+def _preferred_encoders() -> List[str]:
+    requested = os.getenv("DUBVI_REUP_ENCODER")
+    allowed = ["hevc_qsv", "h264_qsv", "libx264"]
+    if requested in allowed:
+        return [requested, *(encoder for encoder in allowed if encoder != requested)]
+    return allowed
+
+
+def _positive_env(name: str, default: int) -> int:
+    value = int(os.getenv(name, str(default)))
+    if value <= 0:
+        raise ValueError(f"{name} must be positive")
+    return value
+
+
 @dataclass
 class PipelineConfig:
     """System configuration for video pipeline processing."""
@@ -20,10 +41,10 @@ class PipelineConfig:
     # CP may place canonical envelopes outside this checkout; keep the repo
     # input directory as the portable fallback when no override is configured.
     input_dir: Path = field(default_factory=lambda: _path_from_env("DUBVI_REUP_INPUT_DIR", BASE_DIR / "input"))
-    processing_dir: Path = BASE_DIR / "processing"
+    processing_dir: Path = field(default_factory=lambda: _runtime_dir("processing", BASE_DIR / "processing"))
     # Output is portable by default and can be redirected for an installed worker.
     output_dir: Path = field(default_factory=lambda: _path_from_env("REUP_OUTPUT_DIR", BASE_DIR / "output"))
-    failed_dir: Path = BASE_DIR / "failed"
+    failed_dir: Path = field(default_factory=lambda: _runtime_dir("failed", BASE_DIR / "failed"))
     assets_dir: Path = BASE_DIR / "assets"
     mascots_dir: Path = BASE_DIR / "assets" / "mascots"
     hooks_dir: Path = BASE_DIR / "assets" / "hooks"
@@ -110,7 +131,7 @@ class PipelineConfig:
     jitter_saturation_range: tuple = (0.98, 1.04)
     jitter_brightness_range: tuple = (-0.01, 0.015)
 
-    # Meta vPDQ & pHash Scorer (Tự động chấm điểm sau khi render)
+    # Sampled-frame dHash similarity heuristic (Tự động chấm điểm sau khi render)
     enable_vpdq_scoring: bool = True
 
     # Scaling flags
@@ -118,9 +139,9 @@ class PipelineConfig:
 
     # Hardware & Encoders
     preferred_encoders: List[str] = field(
-        default_factory=lambda: ["hevc_qsv", "h264_qsv", "libx264"]
+        default_factory=_preferred_encoders
     )
-    max_workers: int = 2  # Optimized for 2-core i3-1115G4 + 20GB RAM
+    max_workers: int = field(default_factory=lambda: _positive_env("DUBVI_REUP_WORKERS", 2))
     qsv_global_quality: int = 25
     cpu_crf: int = 23
     cpu_preset: str = "veryfast"

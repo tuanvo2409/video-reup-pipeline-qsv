@@ -5,7 +5,7 @@ color 0B
 
 echo ===============================================================================
 echo   🚀 HỆ THỐNG LIÊN HOÀN 2 GIAI ĐOẠN: VIDEO PIP  ==^>  DUBVI AI
-echo   • Giai đoạn 1: Bẻ gãy mã băm vPDQ + Render siêu tốc QSV
+echo   • Giai đoạn 1: So sánh sampled-frame dHash heuristic + Render siêu tốc QSV
 echo   • Chuyển tiếp: Tự động publish video + metadata sang DUBVI_MEDIA_DIR đã cấu hình
 echo   • Giai đoạn 2: Sẵn sàng để DUBVI Dịch thuật, Lồng tiếng CapCut & Dán Sub
 echo ===============================================================================

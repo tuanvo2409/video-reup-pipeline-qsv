@@ -5,7 +5,7 @@ import subprocess
 from pathlib import Path
 from typing import Dict, List, Any, Optional
 
-logger = logging.getLogger("VideoPipeline.vPDQScorer")
+logger = logging.getLogger("VideoPipeline.SampledFrameDHashScorer")
 
 def extract_frame_thumbnails(video_path: Path, num_samples: int = 10) -> List[bytes]:
     """
@@ -89,10 +89,13 @@ def hamming_distance(hash1: int, hash2: int, total_bits: int = 240) -> float:
 
 def score_video_pair(original_video: Path, processed_video: Path) -> Dict[str, Any]:
     """
-    Evaluate visual similarity score between original video and processed video.
-    Emulates Meta's vPDQ and Perceptual Hashing duplicate detection metrics.
+    Evaluate a sampled-frame dHash similarity heuristic between two videos.
+
+    The result is advisory only and is not a posting-safety determination.
     """
-    logger.info(f"Computing Meta vPDQ / pHash similarity: '{original_video.name}' vs '{processed_video.name}'...")
+    logger.info(
+        f"Computing sampled-frame dHash similarity heuristic: '{original_video.name}' vs '{processed_video.name}'..."
+    )
     
     orig_frames = extract_frame_thumbnails(original_video, num_samples=10)
     proc_frames = extract_frame_thumbnails(processed_video, num_samples=10)
@@ -120,16 +123,16 @@ def score_video_pair(original_video: Path, processed_video: Path) -> Dict[str, A
     # Scale to percentage
     similarity_pct = round(raw_similarity * 100.0, 2)
 
-    # Threshold evaluation (Meta vPDQ Standard)
+    # Preserve legacy status bands for compatibility; they are heuristic only.
     if similarity_pct < 50.0:
         status = "PASSED"
-        verdict = "Non-duplicate / Unique fingerprint (Safe to post)"
+        verdict = "Lower sampled-frame dHash similarity (heuristic only; review separately)"
     elif similarity_pct < 70.0:
         status = "WARNING"
-        verdict = "Moderate similarity (Consider adding more grain/zoom)"
+        verdict = "Moderate sampled-frame dHash similarity (Review transform settings)"
     else:
         status = "FAILED"
-        verdict = "High visual match with original"
+        verdict = "High sampled-frame dHash similarity (Review output)"
 
     result = {
         "original_file": original_video.name,
@@ -142,7 +145,7 @@ def score_video_pair(original_video: Path, processed_video: Path) -> Dict[str, A
     }
 
     logger.info(
-        f"[vPDQ Assessment] Similarity: {similarity_pct}% | Status: {status} | Verdict: {verdict}"
+        f"[Sampled-frame dHash heuristic] Similarity: {similarity_pct}% | Status: {status} | Verdict: {verdict}"
     )
     return result
 

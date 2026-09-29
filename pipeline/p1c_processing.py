@@ -39,18 +39,33 @@ def process_reup_attempt(accepted: AcceptedReupJob, status_root: Path, *, proces
     """Run legacy processor only against an attempt-owned true copy."""
     job = accepted.document
     source = accepted.media_path
-    scratch_dir = config.processing_dir / "p1c-source" / str(job["reup_job_id"])
+    attempt_dir = config.processing_dir / "p1c-attempts" / str(job["reup_job_id"])
+    scratch_dir = attempt_dir
     scratch = scratch_dir / f"source-{job['reup_job_id']}{source.suffix.lower()}"
     try:
         _verify_source(source, job)
         scratch_dir.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, scratch)
+        _verify_source(scratch, job)
     except Exception as error:
+        scratch.unlink(missing_ok=True)
         _failed(status_root, job, "PROCESSING_FAILED", str(error), now_utc)
         return ProcessingResult("failed")
     try:
         try:
-            result = processor(scratch, override_profile=job["reup_profile"], target_platform=job["target_platform"], send_to_dubvi=False, force_reprocess=True)
+            result = processor(
+                scratch,
+                override_profile=job["reup_profile"],
+                target_platform=job["target_platform"],
+                send_to_dubvi=False,
+                force_reprocess=True,
+                enable_trim=False,
+                enable_tempo=False,
+                enable_smart_scenes=False,
+                custom_tempo=1.0,
+                output_root=output_root,
+                working_dir=attempt_dir,
+            )
         except Exception as error:
             _failed(status_root, job, "PROCESSING_FAILED", str(error), now_utc)
             return ProcessingResult("failed")
@@ -60,7 +75,7 @@ def process_reup_attempt(accepted: AcceptedReupJob, status_root: Path, *, proces
         candidate = getattr(result, "output_file", None)
         try:
             output = publish_reup_output(Path(candidate), job, output_root or config.output_dir)
-        except (OutputPublicationError, TypeError, ValueError) as error:
+        except (OSError, OutputPublicationError, TypeError, ValueError) as error:
             _failed(status_root, job, "OUTPUT_VERIFY_FAILED" if "FINAL_PATH_CONFLICT" not in str(error) else "FINAL_PATH_CONFLICT", str(error), now_utc)
             return ProcessingResult("failed")
         try:
@@ -71,7 +86,7 @@ def process_reup_attempt(accepted: AcceptedReupJob, status_root: Path, *, proces
             handoff = publish_reup_handoff(output.final_path, job, media_root or config.dubvi_media_dir, output_fingerprint=output.fingerprint, created_at_utc=now_utc)
             publish_handoff_published_status(status_root, job, output.fingerprint, handoff.handoff_id, handoff.handoff_ref, occurred_at_utc=now_utc)
             publish_succeeded_status(status_root, job, output.fingerprint, handoff.handoff_id, handoff.handoff_ref, occurred_at_utc=now_utc)
-        except HandoffV2Error:
+        except (HandoffV2Error, OSError):
             return ProcessingResult("handoff_pending", output)
         cleanup_published_output_stage(output)
         return ProcessingResult("succeeded", output, handoff)

@@ -13,7 +13,7 @@ class TestTrustClassifier(unittest.TestCase):
     def test_commercial_content_rejected(self):
         res = classify_video_intent(desc="点击左下角小黄车", asr_transcript="好物推荐，大家快买这个同款")
         self.assertFalse(res["is_trust"])
-        self.assertEqual(res["verdict"], "REJECT_COMMERCIAL_KEYWORDS")
+        self.assertEqual(res["verdict"], "REJECT_HARD_COMMERCIAL")
 
     def test_ad_metadata_rejected(self):
         res = classify_video_intent(desc="Video thường", asr_transcript="Không có gì", extra_metadata={"is_ads": True})

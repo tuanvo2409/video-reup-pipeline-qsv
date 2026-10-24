@@ -304,6 +304,12 @@ def process_single_video(
         trim_end = max(1.0, round(total_duration - trim_end_offset, 3))
         trimmed_str = f"Head: {trim_start}s | Tail: {trim_end_offset}s"
 
+    if trim_end is not None:
+        trim_end = min(trim_end, total_duration)
+        if trim_start >= trim_end or (trim_end - trim_start) < 1.0:
+            trim_start = 0.0
+            trim_end = total_duration
+
     # PySceneDetect Nonlinear Scene Speed Scheduling (Using Profile Speed Range)
     use_smart_scenes = config.enable_smart_scenes if enable_smart_scenes is None else enable_smart_scenes
     scene_schedule = None
@@ -312,10 +318,12 @@ def process_single_video(
     if use_smart_scenes and total_duration > 5.0:
         raw_scenes = detect_scenes(temp_processing_path, threshold=config.scene_threshold)
         if len(raw_scenes) > 1:
+            effective_end = min(trim_end if trim_end is not None else total_duration, total_duration)
             adjusted_scenes = [
-                (max(trim_start, s_start), min(trim_end if trim_end is not None else total_duration, s_end))
+                (max(trim_start, s_start), min(effective_end, s_end))
                 for s_start, s_end in raw_scenes
-                if min(trim_end if trim_end is not None else total_duration, s_end) - max(trim_start, s_start) >= 0.4
+                if max(trim_start, s_start) < min(effective_end, s_end)
+                and (min(effective_end, s_end) - max(trim_start, s_start)) >= 0.4
             ]
             if adjusted_scenes:
                 scene_schedule = assign_scene_speeds(
@@ -367,6 +375,7 @@ def process_single_video(
         trim_end=trim_end,
         scene_schedule=scene_schedule,
         platform_preset=platform_preset,
+        channel_profile=profile,
     )
 
     logger.info(

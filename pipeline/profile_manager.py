@@ -43,32 +43,47 @@ def _find_first_asset(folder: Path, extensions: Tuple[str, ...]) -> Optional[Pat
             return matches[0]
     return None
 
+
+def _approved_profile_asset_paths(profile_name: str) -> tuple[Optional[Path], Optional[Path]]:
+    """Resolve only explicit CP/Reup aliases and their proven asset filenames."""
+    record = config.approved_profile_assets.get(profile_name)
+    if not record:
+        return None, None
+    profile_dir = config.assets_dir / record["directory"]
+    watermark = profile_dir / record["watermark"]
+    return profile_dir, watermark if watermark.is_file() else None
+
 def get_channel_profile(profile_name: str = "default") -> ChannelProfile:
     """
-    Load or dynamically synthesize a unique fingerprint configuration profile
-    for a specific channel/page name.
+    Load an approved page profile over the shared configured transform baseline.
     """
     clean_name = profile_name.strip() if profile_name else "default"
-    prof_folder = PROFILES_DIR / clean_name
-    
-    # 1. Base profile with dynamic entropy seed derived from profile name hash
-    # Ensures each channel gets distinct baseline ranges even with zero configuration!
-    name_hash = int(hashlib.md5(clean_name.encode("utf-8")).hexdigest()[:8], 16)
-    
-    # Slight deterministic variations per profile (e.g. +/- 0.02 speed, +/- 0.01 zoom, grain 1-4)
-    speed_offset = ((name_hash % 7) - 3) * 0.008  # -0.024 to +0.024
-    zoom_offset = ((name_hash % 5) - 2) * 0.005   # -0.010 to +0.010
-    grain_val = 1 + (name_hash % 4)               # 1, 2, 3, or 4
-    hflip_default = bool((name_hash >> 3) & 1) if clean_name != "default" else False
-    
-    base_speed = (
-        round(max(1.06, config.tempo_min + speed_offset), 3),
-        round(min(1.25, config.tempo_max + speed_offset), 3)
-    )
-    base_zoom = (
-        round(max(1.015, config.zoom_min + zoom_offset), 3),
-        round(min(1.065, config.zoom_max + zoom_offset), 3)
-    )
+    approved_profile = clean_name in config.approved_profile_assets
+    if approved_profile:
+        prof_folder, approved_watermark = _approved_profile_asset_paths(clean_name)
+        # No per-page transform difference is recovery-proven; both approved
+        # pages therefore inherit the same configured baseline.
+        base_speed = config.approved_profile_speed_range
+        base_zoom = (config.zoom_min, config.zoom_max)
+        grain_val = config.grain_strength
+        hflip_default = False
+    else:
+        # Preserve legacy profile behavior for non-approved IDs.
+        prof_folder = PROFILES_DIR / clean_name
+        approved_watermark = None
+        name_hash = int(hashlib.md5(clean_name.encode("utf-8")).hexdigest()[:8], 16)
+        speed_offset = ((name_hash % 7) - 3) * 0.008
+        zoom_offset = ((name_hash % 5) - 2) * 0.005
+        grain_val = 1 + (name_hash % 4)
+        hflip_default = bool((name_hash >> 3) & 1) if clean_name != "default" else False
+        base_speed = (
+            round(max(1.06, config.tempo_min + speed_offset), 3),
+            round(min(1.25, config.tempo_max + speed_offset), 3),
+        )
+        base_zoom = (
+            round(max(1.015, config.zoom_min + zoom_offset), 3),
+            round(min(1.065, config.zoom_max + zoom_offset), 3),
+        )
 
     profile = ChannelProfile(
         name=clean_name,
@@ -82,11 +97,11 @@ def get_channel_profile(profile_name: str = "default") -> ChannelProfile:
         jitter_saturation_range=config.jitter_saturation_range,
         jitter_brightness_range=config.jitter_brightness_range,
         enable_hflip=hflip_default,
-        profile_dir=prof_folder if prof_folder.exists() else None,
+        profile_dir=prof_folder if prof_folder and prof_folder.exists() else None,
     )
 
     # 2. Check for profile-specific JSON configuration override
-    if prof_folder.exists():
+    if prof_folder and prof_folder.exists():
         json_file = prof_folder / "profile.json"
         if json_file.exists():
             try:
@@ -107,7 +122,7 @@ def get_channel_profile(profile_name: str = "default") -> ChannelProfile:
 
         # Resolve profile-specific assets
         profile.mascot_path = _find_first_asset(prof_folder / "mascots", config.supported_image_extensions) or _find_first_asset(prof_folder, (".png", ".webp"))
-        profile.watermark_path = _find_first_asset(prof_folder / "watermarks", config.supported_image_extensions)
+        profile.watermark_path = approved_watermark or _find_first_asset(prof_folder / "watermarks", config.supported_image_extensions)
         profile.bgm_dir = prof_folder / "bgm" if (prof_folder / "bgm").exists() else None
         profile.hooks_dir = prof_folder / "hooks" if (prof_folder / "hooks").exists() else None
         profile.outros_dir = prof_folder / "outros" if (prof_folder / "outros").exists() else None

@@ -1,15 +1,15 @@
 @echo off
 chcp 65001 >nul
-title [VIDEO PIP] - CHẠY REUP HÀNG LOẠT SIÊU TỐC (INTEL QSV + VPDQ PASSED)
+title [VIDEO PIP] - CHẠY REUP HÀNG LOẠT SIÊU TỐC (INTEL QSV + SAMPLED-FRAME DHASH HEURISTIC)
 color 0A
 
 echo ===============================================================================
-echo   🚀 HỆ THỐNG XỬ LÝ VIDEO REUP VƯỢT THUẬT TOÁN (GIAI ĐOẠN 1)
+echo   🚀 HỆ THỐNG XỬ LÝ VIDEO REUP THEO CẤU HÌNH (GIAI ĐOẠN 1)
 echo   • Gia tốc phần cứng: Intel Quick Sync (hevc_qsv)
-echo   • Bẻ trục thời gian: PySceneDetect 26 phân cảnh biến thiên
-echo   • Bẻ ma trận thị giác: Zero-Border Zoom + Mask Vô Hình 98%% + Lật Gương
-echo   • Chuẩn kiểm định: Meta vPDQ PASSED (<50%% Match)
-echo   • Thư mục xuất: C:\Users\vmath\Downloads\douyinnnnnnnnnnn\video reup raw
+echo   • Điều chỉnh tốc độ theo cảnh: PySceneDetect 26 phân cảnh biến thiên
+echo   • Biến đổi khung hình: Zero-Border Zoom + Mask Vô Hình 98%% + Lật Gương
+echo   • Tín hiệu tham khảo: sampled-frame dHash heuristic (<50%% similarity band)
+echo   • Thư mục xuất: REUP_OUTPUT_DIR đã cấu hình (mặc định: output/ trong repository)
 echo ===============================================================================
 echo.
 
@@ -25,5 +25,4 @@ echo   • Video sạch mã băm đã được xuất ra thư mục 'video reup 
 echo ===============================================================================
 echo.
 
-explorer "C:\Users\vmath\Downloads\douyinnnnnnnnnnn\video reup raw"
 pause

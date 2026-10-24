@@ -83,7 +83,7 @@ def get_platform_preset(platform_name: Optional[str]) -> PlatformPreset:
     if not platform_name:
         return PLATFORM_PRESETS["universal"]
     key = platform_name.lower().strip()
-    if key in ["fb", "facebook", "reels", "fb_reels"]:
+    if key in ["fb", "facebook", "reels", "fb_reels", "facebook-reels"]:
         return PLATFORM_PRESETS["facebook"]
     elif key in ["tt", "tiktok"]:
         return PLATFORM_PRESETS["tiktok"]

@@ -4,6 +4,7 @@ from typing import List, Optional, Tuple
 from pipeline.config import config
 from pipeline.hardware import detect_best_encoder, get_encoder_args
 from pipeline.platform_presets import PlatformPreset, get_platform_preset
+from pipeline.profile_manager import ChannelProfile
 
 class FFmpegCommandBuilder:
     """Builds robust, single-pass FFmpeg commands with Multi-Platform Adaptive Presets, PySceneDetect speedup, and Intel QSV."""
@@ -35,6 +36,7 @@ class FFmpegCommandBuilder:
         trim_end: Optional[float] = None,
         scene_schedule: Optional[List[Tuple[float, float, float]]] = None,
         platform_preset: Optional[PlatformPreset] = None,
+        channel_profile: Optional[ChannelProfile] = None,
     ):
         self.input_path = input_path
         self.output_path = output_path
@@ -47,6 +49,7 @@ class FFmpegCommandBuilder:
             config.default_watermark if config.default_watermark.exists() else None
         )
         self.platform_preset = platform_preset or get_platform_preset("universal")
+        self.channel_profile = channel_profile
 
         self.layout_mode = layout_mode or config.layout_mode
         self.encoder = encoder or detect_best_encoder()
@@ -82,7 +85,9 @@ class FFmpegCommandBuilder:
         # Enforce max duration limit for platforms like YouTube Shorts (<= 58.5s)
         if self.platform_preset.max_duration_seconds:
             max_d = self.platform_preset.max_duration_seconds
-            if self.trim_end is None or (self.trim_end - self.trim_start > max_d):
+            if self.trim_end is not None:
+                self.trim_end = min(self.trim_end, self.trim_start + max_d)
+            else:
                 self.trim_end = self.trim_start + max_d
 
         self.scene_schedule = scene_schedule
@@ -90,6 +95,8 @@ class FFmpegCommandBuilder:
         # Randomize subtle zoom factor (1.02x to 1.05x) centered
         if custom_zoom:
             self.zoom = custom_zoom
+        elif self.channel_profile:
+            self.zoom = round(random.uniform(*self.channel_profile.zoom_range), 3)
         else:
             self.zoom = round(random.uniform(config.zoom_min, config.zoom_max), 3)
 
@@ -98,15 +105,22 @@ class FFmpegCommandBuilder:
         if custom_tempo:
             self.speed = custom_tempo
         elif self.enable_tempo:
-            self.speed = round(random.uniform(config.tempo_min, config.tempo_max) + speed_bias, 3)
+            if self.channel_profile:
+                self.speed = round(random.uniform(*self.channel_profile.speed_range) + speed_bias, 3)
+            else:
+                self.speed = round(random.uniform(config.tempo_min, config.tempo_max) + speed_bias, 3)
         else:
             self.speed = 1.0 + speed_bias
 
         # Randomize color jitter values with platform biases
         if self.enable_jitter:
-            self.contrast = round(random.uniform(*config.jitter_contrast_range) * self.platform_preset.contrast_bias, 3)
-            self.saturation = round(random.uniform(*config.jitter_saturation_range) * self.platform_preset.saturation_bias, 3)
-            self.brightness = round(random.uniform(*config.jitter_brightness_range) + self.platform_preset.brightness_bias, 3)
+            c_range = self.channel_profile.jitter_contrast_range if self.channel_profile else config.jitter_contrast_range
+            s_range = self.channel_profile.jitter_saturation_range if self.channel_profile else config.jitter_saturation_range
+            b_range = self.channel_profile.jitter_brightness_range if self.channel_profile else config.jitter_brightness_range
+
+            self.contrast = round(random.uniform(*c_range) * self.platform_preset.contrast_bias, 3)
+            self.saturation = round(random.uniform(*s_range) * self.platform_preset.saturation_bias, 3)
+            self.brightness = round(random.uniform(*b_range) + self.platform_preset.brightness_bias, 3)
         else:
             self.contrast = round(1.0 * self.platform_preset.contrast_bias, 3)
             self.saturation = round(1.0 * self.platform_preset.saturation_bias, 3)
@@ -228,7 +242,8 @@ class FFmpegCommandBuilder:
             post_filters.append(self.platform_preset.colorbalance_filter)
 
         if self.enable_grain:
-            eff_grain = max(1, config.grain_strength + self.platform_preset.grain_strength_bias)
+            base_grain = self.channel_profile.grain_strength if self.channel_profile else config.grain_strength
+            eff_grain = max(1, base_grain + self.platform_preset.grain_strength_bias)
             post_filters.append(f"noise=alls={eff_grain}:allf=t+u")
 
         post_filters_str = ("," + ",".join(post_filters)) if post_filters else ""

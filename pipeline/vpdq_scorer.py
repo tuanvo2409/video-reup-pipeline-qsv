@@ -7,7 +7,7 @@ from typing import Dict, List, Any, Optional
 
 logger = logging.getLogger("VideoPipeline.SampledFrameDHashScorer")
 
-def extract_frame_thumbnails(video_path: Path, num_samples: int = 10) -> List[bytes]:
+def extract_frame_thumbnails(video_path: Path, num_samples: int = 5) -> List[bytes]:
     """
     Extract raw 16x16 grayscale thumbnail bytes for num_samples frames across the video.
     Uses native FFmpeg rawvideo pipe - blazing fast (<0.2s).
@@ -97,8 +97,8 @@ def score_video_pair(original_video: Path, processed_video: Path) -> Dict[str, A
         f"Computing sampled-frame dHash similarity heuristic: '{original_video.name}' vs '{processed_video.name}'..."
     )
     
-    orig_frames = extract_frame_thumbnails(original_video, num_samples=10)
-    proc_frames = extract_frame_thumbnails(processed_video, num_samples=10)
+    orig_frames = extract_frame_thumbnails(original_video, num_samples=5)
+    proc_frames = extract_frame_thumbnails(processed_video, num_samples=5)
 
     if not orig_frames or not proc_frames:
         return {
